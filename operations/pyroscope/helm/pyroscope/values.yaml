@@ -9,7 +9,7 @@ pyroscope:
     repository: grafana/pyroscope
     pullPolicy: IfNotPresent
     # Overrides the image tag whose default is the chart appVersion.
-    tag: "1.0.0"
+    tag: "1.2.0"
 
   extraArgs:
     log.level: debug
@@ -25,8 +25,13 @@ pyroscope:
   extraEnvFrom: []
 
   imagePullSecrets: []
+  dnsPolicy: ClusterFirst
+  initContainers: []
   nameOverride: ""
   fullnameOverride: ""
+
+  rbac:
+    create: true
 
   serviceAccount:
     # Specifies whether a service account should be created
@@ -53,6 +58,10 @@ pyroscope:
     runAsUser: 10001
     runAsNonRoot: true
 
+  podDisruptionBudget:
+    enabled: true
+    maxUnavailable: 1
+
   securityContext:
     {}
     # capabilities:
@@ -66,6 +75,8 @@ pyroscope:
     type: ClusterIP
     port: 4040
     port_name: http2
+    scheme: HTTP
+    annotations: {}
 
   memberlist:
     port: 7946
@@ -208,5 +219,8 @@ minio:
 
 ingress:
   enabled: false
+  className: ""
   # hosts:
   #   - localhost
+  # tls:
+  #   - secretName: certificate

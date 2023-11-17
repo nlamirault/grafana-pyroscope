@@ -181,12 +181,27 @@ func (pi *profilesIndex) Add(ps *schemav1.InMemoryProfile, lbs phlaremodel.Label
 		pi.metrics.seriesCreated.WithLabelValues(profileName).Inc()
 	}
 
-	profiles.profiles = append(profiles.profiles, ps)
+	// profile is latest in this series, use a shortcut
+	if ps.TimeNanos > profiles.maxTime {
+		// update max timeNanos
+		profiles.maxTime = ps.TimeNanos
+
+		// add profile to in memory slice
+		profiles.profiles = append(profiles.profiles, ps)
+	} else {
+		// use binary search to find position
+		i := sort.Search(len(profiles.profiles), func(i int) bool {
+			return profiles.profiles[i].TimeNanos > ps.TimeNanos
+		})
+
+		// insert into slice at correct position
+		profiles.profiles = append(profiles.profiles, &schemav1.InMemoryProfile{})
+		copy(profiles.profiles[i+1:], profiles.profiles[i:])
+		profiles.profiles[i] = ps
+	}
+
 	if ps.TimeNanos < profiles.minTime {
 		profiles.minTime = ps.TimeNanos
-	}
-	if ps.TimeNanos > profiles.maxTime {
-		profiles.maxTime = ps.TimeNanos
 	}
 
 	pi.metrics.profiles.Set(float64(pi.totalProfiles.Inc()))
@@ -445,6 +460,9 @@ func (pi *profilesIndex) writeTo(ctx context.Context, path string) ([][]rowRange
 }
 
 func (pi *profilesIndex) cutRowGroup(rgProfiles []schemav1.InMemoryProfile) error {
+	pi.mutex.Lock()
+	defer pi.mutex.Unlock()
+
 	// adding rowGroup and rowNum information per fingerprint
 	rowRangePerFP := make(map[model.Fingerprint]*rowRange, len(pi.profilesPerFP))
 	countPerFP := make(map[model.Fingerprint]int, len(pi.profilesPerFP))
@@ -464,9 +482,6 @@ func (pi *profilesIndex) cutRowGroup(rgProfiles []schemav1.InMemoryProfile) erro
 			return fmt.Errorf("rowRange is not matching up, ensure that the ordering of the profile row group is ordered correctly, current row_num=%d, expect range %d-%d", rowNum, rowRange.rowNum, int(rowRange.rowNum)+rowRange.length)
 		}
 	}
-
-	pi.mutex.Lock()
-	defer pi.mutex.Unlock()
 
 	pi.rowGroupsOnDisk += 1
 

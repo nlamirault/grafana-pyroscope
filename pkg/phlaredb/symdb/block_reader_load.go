@@ -4,16 +4,23 @@ import (
 	"bufio"
 	"context"
 	"io"
-	"sort"
 
 	"github.com/grafana/dskit/multierror"
 	"github.com/parquet-go/parquet-go"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/grafana/pyroscope/pkg/iter"
+	parquetobj "github.com/grafana/pyroscope/pkg/objstore/parquet"
 	pparquet "github.com/grafana/pyroscope/pkg/parquet"
 )
 
+// Load loads all the partitions into memory. Partitions are kept
+// in memory during the whole lifetime of the Reader object.
+//
+// The main user of the function is Rewriter: as far as is not
+// known which partitions will be fetched in advance, but it is
+// known that all of them or majority will be requested, preloading
+// all of them is more efficient yet consumes more memory.
 func (r *Reader) Load(ctx context.Context) error {
 	g, ctx := errgroup.WithContext(ctx)
 	g.Go(func() error { return r.loadStacktraces(ctx) })
@@ -29,21 +36,13 @@ func (r *Reader) loadStacktraces(ctx context.Context) error {
 		return err
 	}
 
-	partitions := make([]*partition, len(r.partitions))
+	offset := r.partitions[0].stacktraceChunks[0].header.Offset
 	var size int64
-	var i int
 	for _, v := range r.partitions {
 		for _, c := range v.stacktraceChunks {
 			size += c.header.Size
 		}
-		partitions[i] = v
-		i++
 	}
-	sort.Slice(partitions, func(i, j int) bool {
-		return partitions[i].stacktraceChunks[0].header.Offset <
-			partitions[j].stacktraceChunks[0].header.Offset
-	})
-	offset := partitions[0].stacktraceChunks[0].header.Offset
 
 	rc, err := r.bucket.GetRange(ctx, f.RelPath, offset, size)
 	if err != nil {
@@ -54,7 +53,7 @@ func (r *Reader) loadStacktraces(ctx context.Context) error {
 	}()
 
 	buf := bufio.NewReaderSize(rc, r.chunkFetchBufferSize)
-	for _, p := range partitions {
+	for _, p := range r.partitions {
 		for _, c := range p.stacktraceChunks {
 			if err = c.readFrom(io.LimitReader(buf, c.header.Size)); err != nil {
 				return err
@@ -66,22 +65,10 @@ func (r *Reader) loadStacktraces(ctx context.Context) error {
 }
 
 func (r *Reader) loadParquetTables(g *errgroup.Group) {
-	partitions := make([]*partition, len(r.partitions))
-	var i int
-	for _, v := range r.partitions {
-		partitions[i] = v
-		i++
-	}
-	sort.Slice(partitions, func(i, j int) bool {
-		a := partitions[i].locations.headers[0]
-		b := partitions[j].locations.headers[0]
-		return (a.RowGroup + a.Index) < (b.RowGroup + b.Index)
-	})
-
-	g.Go(func() error { return withRowIterator(r.locations, partitions, loadLocations) })
-	g.Go(func() error { return withRowIterator(r.functions, partitions, loadFunctions) })
-	g.Go(func() error { return withRowIterator(r.mappings, partitions, loadMappings) })
-	g.Go(func() error { return withRowIterator(r.strings, partitions, loadStrings) })
+	g.Go(func() error { return withRowIterator(r.locations, r.partitions, loadLocations) })
+	g.Go(func() error { return withRowIterator(r.functions, r.partitions, loadFunctions) })
+	g.Go(func() error { return withRowIterator(r.mappings, r.partitions, loadMappings) })
+	g.Go(func() error { return withRowIterator(r.strings, r.partitions, loadStrings) })
 }
 
 func loadLocations(p *partition, i iter.Iterator[parquet.Row]) error { return p.locations.loadFrom(i) }
@@ -94,7 +81,7 @@ func loadStrings(p *partition, i iter.Iterator[parquet.Row]) error { return p.st
 
 type loader func(*partition, iter.Iterator[parquet.Row]) error
 
-func withRowIterator(f parquetFile, partitions []*partition, x loader) error {
+func withRowIterator(f parquetobj.File, partitions []*partition, x loader) error {
 	rows := parquet.MultiRowGroup(f.RowGroups()...).Rows()
 	defer func() {
 		_ = rows.Close()
@@ -109,9 +96,6 @@ func withRowIterator(f parquetFile, partitions []*partition, x loader) error {
 }
 
 func (t *parquetTableRange[M, P]) loadFrom(iter iter.Iterator[parquet.Row]) error {
-	if t.r++; t.r > 1 {
-		return nil
-	}
 	var s uint32
 	for _, h := range t.headers {
 		s += h.Rows

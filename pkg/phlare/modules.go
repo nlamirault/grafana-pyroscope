@@ -31,6 +31,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	statusv1 "github.com/grafana/pyroscope/api/gen/proto/go/status/v1"
+	"github.com/grafana/pyroscope/pkg/compactor"
 	"github.com/grafana/pyroscope/pkg/distributor"
 	"github.com/grafana/pyroscope/pkg/frontend"
 	"github.com/grafana/pyroscope/pkg/ingester"
@@ -67,9 +68,9 @@ const (
 	RuntimeConfig     string = "runtime-config"
 	Overrides         string = "overrides"
 	OverridesExporter string = "overrides-exporter"
+	Compactor         string = "compactor"
 
 	// QueryFrontendTripperware string = "query-frontend-tripperware"
-	// Compactor                string = "compactor"
 	// IndexGateway             string = "index-gateway"
 	// IndexGatewayRing         string = "index-gateway-ring"
 )
@@ -165,6 +166,19 @@ func (f *Phlare) initQueryScheduler() (services.Service, error) {
 	f.API.RegisterQueryScheduler(s)
 
 	return s, nil
+}
+
+func (f *Phlare) initCompactor() (serv services.Service, err error) {
+	f.Cfg.Compactor.ShardingRing.Common.ListenPort = f.Cfg.Server.HTTPListenPort
+
+	f.Compactor, err = compactor.NewMultitenantCompactor(f.Cfg.Compactor, f.storageBucket, f.Overrides, log.With(f.logger, "component", "compactor"), f.reg)
+	if err != nil {
+		return
+	}
+
+	// Expose HTTP endpoints.
+	f.API.RegisterCompactor(f.Compactor)
+	return f.Compactor, nil
 }
 
 // setupWorkerTimeout sets the max loop duration for the querier worker and frontend worker
@@ -282,9 +296,9 @@ func (f *Phlare) initMemberlistKV() (services.Service, error) {
 	f.Cfg.Distributor.DistributorRing.KVStore.MemberlistKV = f.MemberlistKV.GetMemberlistKV
 	f.Cfg.Ingester.LifecyclerConfig.RingConfig.KVStore.MemberlistKV = f.MemberlistKV.GetMemberlistKV
 	f.Cfg.QueryScheduler.ServiceDiscovery.SchedulerRing.KVStore.MemberlistKV = f.MemberlistKV.GetMemberlistKV
-	f.Cfg.OverridesExporter.Ring.KVStore.MemberlistKV = f.MemberlistKV.GetMemberlistKV
-	f.Cfg.StoreGateway.ShardingRing.KVStore.MemberlistKV = f.MemberlistKV.GetMemberlistKV
-
+	f.Cfg.OverridesExporter.Ring.Ring.KVStore.MemberlistKV = f.MemberlistKV.GetMemberlistKV
+	f.Cfg.StoreGateway.ShardingRing.Ring.KVStore.MemberlistKV = f.MemberlistKV.GetMemberlistKV
+	f.Cfg.Compactor.ShardingRing.Common.KVStore.MemberlistKV = f.MemberlistKV.GetMemberlistKV
 	f.Cfg.Frontend.QuerySchedulerDiscovery = f.Cfg.QueryScheduler.ServiceDiscovery
 	f.Cfg.Worker.QuerySchedulerDiscovery = f.Cfg.QueryScheduler.ServiceDiscovery
 
@@ -306,7 +320,10 @@ func (f *Phlare) initRing() (_ services.Service, err error) {
 
 func (f *Phlare) initStorage() (_ services.Service, err error) {
 	objectStoreTypeStats.Set(f.Cfg.Storage.Bucket.Backend)
-	if cfg := f.Cfg.Storage.Bucket; cfg.Backend != "filesystem" {
+	if cfg := f.Cfg.Storage.Bucket; cfg.Backend != objstoreclient.None {
+		if cfg.Backend == objstoreclient.Filesystem {
+			level.Warn(f.logger).Log("msg", "when running with storage.backend 'filesystem' it is important that all replicas/components share the same filesystem")
+		}
 		b, err := objstoreclient.NewBucket(
 			f.context(),
 			cfg,
@@ -345,7 +362,7 @@ func (f *Phlare) initIngester() (_ services.Service, err error) {
 }
 
 func (f *Phlare) initStoreGateway() (serv services.Service, err error) {
-	f.Cfg.StoreGateway.ShardingRing.ListenPort = f.Cfg.Server.HTTPListenPort
+	f.Cfg.StoreGateway.ShardingRing.Ring.ListenPort = f.Cfg.Server.HTTPListenPort
 	if f.storageBucket == nil {
 		return nil, nil
 	}

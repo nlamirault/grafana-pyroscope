@@ -1,4 +1,4 @@
-import { parseResponse, requestWithOrgID } from '@pyroscope/services/base';
+import { parseResponse, request } from '@pyroscope/services/base';
 import { z } from 'zod';
 
 const labelNamesSchema = z.preprocess(
@@ -32,19 +32,18 @@ export function queryToMatchers(query: string) {
   return [`{__profile_type__=\"${query}\"}`];
 }
 
-export async function fetchTags(query: string, _from: number, _until: number) {
-  const response = await requestWithOrgID(
-    '/querier.v1.QuerierService/LabelNames',
-    {
-      method: 'POST',
-      body: JSON.stringify({
-        matchers: queryToMatchers(query),
-      }),
-      headers: {
-        'content-type': 'application/json',
-      },
-    }
-  );
+export async function fetchTags(query: string, from: number, until: number) {
+  const response = await request('/querier.v1.QuerierService/LabelNames', {
+    method: 'POST',
+    body: JSON.stringify({
+      matchers: queryToMatchers(query),
+      start: from,
+      end: until,
+    }),
+    headers: {
+      'content-type': 'application/json',
+    },
+  });
   const isMetaTag = (tag: string) => tag.startsWith('__') && tag.endsWith('__');
 
   return parseResponse<string[]>(
@@ -58,22 +57,21 @@ export async function fetchTags(query: string, _from: number, _until: number) {
 export async function fetchLabelValues(
   label: string,
   query: string,
-  _from: number,
-  _until: number
+  from: number,
+  until: number
 ) {
-  const response = await requestWithOrgID(
-    '/querier.v1.QuerierService/LabelValues',
-    {
-      method: 'POST',
-      body: JSON.stringify({
-        matchers: queryToMatchers(query),
-        name: label,
-      }),
-      headers: {
-        'content-type': 'application/json',
-      },
-    }
-  );
+  const response = await request('/querier.v1.QuerierService/LabelValues', {
+    method: 'POST',
+    body: JSON.stringify({
+      matchers: queryToMatchers(query),
+      name: label,
+      start: from,
+      end: until,
+    }),
+    headers: {
+      'content-type': 'application/json',
+    },
+  });
 
   return parseResponse<string[]>(
     response,

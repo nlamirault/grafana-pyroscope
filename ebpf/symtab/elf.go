@@ -9,7 +9,9 @@ import (
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
+	"github.com/grafana/pyroscope/ebpf/metrics"
 	elf2 "github.com/grafana/pyroscope/ebpf/symtab/elf"
+	"github.com/ianlancetaylor/demangle"
 )
 
 var (
@@ -31,7 +33,9 @@ type ElfTable struct {
 	procMap *ProcMap
 }
 type SymbolOptions struct {
-	GoTableFallback bool
+	GoTableFallback    bool
+	PythonFullFilePath bool
+	DemangleOptions    []demangle.Option
 }
 
 var DefaultSymbolOptions = &SymbolOptions{
@@ -40,13 +44,16 @@ var DefaultSymbolOptions = &SymbolOptions{
 
 type ElfTableOptions struct {
 	ElfCache      *ElfCache
-	Metrics       *Metrics // may be nil for tests
+	Metrics       *metrics.SymtabMetrics
 	SymbolOptions *SymbolOptions
 }
 
 func NewElfTable(logger log.Logger, procMap *ProcMap, fs string, elfFilePath string, options ElfTableOptions) *ElfTable {
 	if options.SymbolOptions == nil {
 		options.SymbolOptions = DefaultSymbolOptions
+	}
+	if options.Metrics == nil {
+		panic("metrics is nil")
 	}
 	res := &ElfTable{
 		procMap:     procMap,
@@ -163,7 +170,9 @@ func (et *ElfTable) createSymbolTable(me *elf2.MMapedElfFile) (SymbolNameResolve
 	if !et.options.SymbolOptions.GoTableFallback && goErr == nil {
 		return goTable, nil
 	}
-	symbolOptions := elf2.SymbolsOptions{}
+	symbolOptions := elf2.SymbolsOptions{
+		DemangleOptions: et.options.SymbolOptions.DemangleOptions,
+	}
 	if goErr == nil && goTable.Index.Entry.Length() > 0 {
 		symbolOptions.FilterFrom = goTable.Index.Entry.Get(0)
 		symbolOptions.FilterTo = goTable.Index.End

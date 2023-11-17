@@ -8,15 +8,19 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bufbuild/connect-go"
 	"github.com/oklog/ulid"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/goleak"
 
 	ingestv1 "github.com/grafana/pyroscope/api/gen/proto/go/ingester/v1"
 	typesv1 "github.com/grafana/pyroscope/api/gen/proto/go/types/v1"
 	"github.com/grafana/pyroscope/pkg/iter"
+	"github.com/grafana/pyroscope/pkg/model"
 	"github.com/grafana/pyroscope/pkg/objstore/providers/filesystem"
 	"github.com/grafana/pyroscope/pkg/phlaredb/block"
+	"github.com/grafana/pyroscope/pkg/phlaredb/tsdb/index"
 )
 
 func TestQuerierBlockEviction(t *testing.T) {
@@ -145,9 +149,66 @@ func TestBlockCompatability(t *testing.T) {
 	}
 }
 
+func TestBlockCompatability_SelectMergeSpans(t *testing.T) {
+	path := "./block/testdata/"
+	bucket, err := filesystem.NewBucket(path)
+	require.NoError(t, err)
+
+	ctx := context.Background()
+	metas, err := NewBlockQuerier(ctx, bucket).BlockMetas(ctx)
+	require.NoError(t, err)
+
+	for _, meta := range metas {
+		t.Run(fmt.Sprintf("block-v%d-%s", meta.Version, meta.ULID.String()), func(t *testing.T) {
+			q := NewSingleBlockQuerierFromMeta(ctx, bucket, meta)
+			require.NoError(t, q.Open(ctx))
+
+			profilesTypes, err := q.index.LabelValues("__profile_type__")
+			require.NoError(t, err)
+
+			profileCount := 0
+
+			for _, profileType := range profilesTypes {
+				t.Log(profileType)
+				profileTypeParts := strings.Split(profileType, ":")
+
+				it, err := q.SelectMatchingProfiles(ctx, &ingestv1.SelectProfilesRequest{
+					LabelSelector: "{}",
+					Start:         0,
+					End:           time.Now().UnixMilli(),
+					Type: &typesv1.ProfileType{
+						Name:       profileTypeParts[0],
+						SampleType: profileTypeParts[1],
+						SampleUnit: profileTypeParts[2],
+						PeriodType: profileTypeParts[3],
+						PeriodUnit: profileTypeParts[4],
+					},
+				})
+				require.NoError(t, err)
+
+				pcIt := &profileCounter{Iterator: it}
+
+				spanSelector, err := model.NewSpanSelector([]string{})
+				require.NoError(t, err)
+				resp, err := q.MergeBySpans(ctx, pcIt, spanSelector)
+				require.NoError(t, err)
+
+				require.Zero(t, resp.Total())
+				profileCount += pcIt.count
+			}
+
+			require.Zero(t, profileCount)
+		})
+	}
+}
+
 type fakeQuerier struct {
 	Querier
 	doErr bool
+}
+
+func (f *fakeQuerier) BlockID() string {
+	return "block-id"
 }
 
 func (f *fakeQuerier) SelectMatchingProfiles(ctx context.Context, params *ingestv1.SelectProfilesRequest) (iter.Iterator[Profile], error) {
@@ -174,4 +235,868 @@ func TestSelectMatchingProfilesCleanUp(t *testing.T) {
 		&fakeQuerier{doErr: true},
 	})
 	require.Error(t, err)
+}
+
+func Test_singleBlockQuerier_Series(t *testing.T) {
+	ctx := context.Background()
+	reader, err := index.NewFileReader("testdata/01HA2V3CPSZ9E0HMQNNHH89WSS/index.tsdb")
+	assert.NoError(t, err)
+
+	q := &singleBlockQuerier{
+		metrics: newBlocksMetrics(nil),
+		meta:    &block.Meta{ULID: ulid.MustParse("01HA2V3CPSZ9E0HMQNNHH89WSS")},
+		opened:  true, // Skip trying to open the block.
+		index:   reader,
+	}
+
+	t.Run("get all names", func(t *testing.T) {
+		want := []string{
+			"__delta__",
+			"__name__",
+			"__period_type__",
+			"__period_unit__",
+			"__profile_type__",
+			"__service_name__",
+			"__type__",
+			"__unit__",
+			"foo",
+			"function",
+			"pyroscope_spy",
+			"service_name",
+			"target",
+			"version",
+		}
+		got, err := q.index.LabelNames()
+		assert.NoError(t, err)
+		assert.Equal(t, want, got)
+	})
+
+	t.Run("get label", func(t *testing.T) {
+		want := []*typesv1.Labels{
+			{Labels: []*typesv1.LabelPair{
+				{Name: "__name__", Value: "block"},
+			}},
+			{Labels: []*typesv1.LabelPair{
+				{Name: "__name__", Value: "goroutine"},
+			}},
+			{Labels: []*typesv1.LabelPair{
+				{Name: "__name__", Value: "memory"},
+			}},
+			{Labels: []*typesv1.LabelPair{
+				{Name: "__name__", Value: "mutex"},
+			}},
+			{Labels: []*typesv1.LabelPair{
+				{Name: "__name__", Value: "process_cpu"},
+			}},
+		}
+		got, err := q.Series(ctx, &ingestv1.SeriesRequest{
+			LabelNames: []string{
+				"__name__",
+			},
+		})
+
+		assert.NoError(t, err)
+		assert.Equal(t, want, got)
+	})
+
+	t.Run("get label with matcher", func(t *testing.T) {
+		want := []*typesv1.Labels{
+			{Labels: []*typesv1.LabelPair{
+				{Name: "__name__", Value: "block"},
+			}},
+		}
+		got, err := q.Series(ctx, &ingestv1.SeriesRequest{
+			Matchers:   []string{`{__name__="block"}`},
+			LabelNames: []string{"__name__"},
+		})
+
+		assert.NoError(t, err)
+		assert.Equal(t, want, got)
+	})
+
+	t.Run("get multiple labels", func(t *testing.T) {
+		want := []*typesv1.Labels{
+			{Labels: []*typesv1.LabelPair{
+				{Name: "__name__", Value: "block"},
+				{Name: "__type__", Value: "contentions"},
+			}},
+			{Labels: []*typesv1.LabelPair{
+				{Name: "__name__", Value: "block"},
+				{Name: "__type__", Value: "delay"},
+			}},
+			{Labels: []*typesv1.LabelPair{
+				{Name: "__name__", Value: "goroutine"},
+				{Name: "__type__", Value: "goroutines"},
+			}},
+			{Labels: []*typesv1.LabelPair{
+				{Name: "__name__", Value: "memory"},
+				{Name: "__type__", Value: "alloc_objects"},
+			}},
+			{Labels: []*typesv1.LabelPair{
+				{Name: "__name__", Value: "memory"},
+				{Name: "__type__", Value: "alloc_space"},
+			}},
+			{Labels: []*typesv1.LabelPair{
+				{Name: "__name__", Value: "memory"},
+				{Name: "__type__", Value: "inuse_objects"},
+			}},
+			{Labels: []*typesv1.LabelPair{
+				{Name: "__name__", Value: "memory"},
+				{Name: "__type__", Value: "inuse_space"},
+			}},
+			{Labels: []*typesv1.LabelPair{
+				{Name: "__name__", Value: "mutex"},
+				{Name: "__type__", Value: "contentions"},
+			}},
+			{Labels: []*typesv1.LabelPair{
+				{Name: "__name__", Value: "mutex"},
+				{Name: "__type__", Value: "delay"},
+			}},
+			{Labels: []*typesv1.LabelPair{
+				{Name: "__name__", Value: "process_cpu"},
+				{Name: "__type__", Value: "cpu"},
+			}},
+		}
+		got, err := q.Series(ctx, &ingestv1.SeriesRequest{
+			LabelNames: []string{"__name__", "__type__"},
+		})
+
+		assert.NoError(t, err)
+		assert.Equal(t, want, got)
+	})
+
+	t.Run("get multiple labels with matcher", func(t *testing.T) {
+		want := []*typesv1.Labels{
+			{Labels: []*typesv1.LabelPair{
+				{Name: "__name__", Value: "memory"},
+				{Name: "__type__", Value: "alloc_objects"},
+			}},
+		}
+		got, err := q.Series(ctx, &ingestv1.SeriesRequest{
+			Matchers:   []string{`{__name__="memory",__type__="alloc_objects"}`},
+			LabelNames: []string{"__name__", "__type__"},
+		})
+
+		assert.NoError(t, err)
+		assert.Equal(t, want, got)
+	})
+
+	t.Run("empty labels and empty matcher", func(t *testing.T) {
+		want := []*typesv1.Labels{
+			{Labels: []*typesv1.LabelPair{
+				{Name: "__delta__", Value: "false"},
+				{Name: "__name__", Value: "block"},
+				{Name: "__profile_type__", Value: "block:contentions:count::"},
+				{Name: "__service_name__", Value: "pyroscope"},
+				{Name: "__type__", Value: "contentions"},
+				{Name: "__unit__", Value: "count"},
+				{Name: "pyroscope_spy", Value: "gospy"},
+				{Name: "service_name", Value: "pyroscope"},
+				{Name: "target", Value: "all"},
+				{Name: "version", Value: "label-names-store-gateway-0e430f1e-WIP"},
+			}},
+			{Labels: []*typesv1.LabelPair{
+				{Name: "__delta__", Value: "false"},
+				{Name: "__name__", Value: "block"},
+				{Name: "__profile_type__", Value: "block:delay:nanoseconds::"},
+				{Name: "__service_name__", Value: "pyroscope"},
+				{Name: "__type__", Value: "delay"},
+				{Name: "__unit__", Value: "nanoseconds"},
+				{Name: "pyroscope_spy", Value: "gospy"},
+				{Name: "service_name", Value: "pyroscope"},
+				{Name: "target", Value: "all"},
+				{Name: "version", Value: "label-names-store-gateway-0e430f1e-WIP"},
+			}},
+			{Labels: []*typesv1.LabelPair{
+				{Name: "__delta__", Value: "false"},
+				{Name: "__name__", Value: "goroutine"},
+				{Name: "__profile_type__", Value: "goroutine:goroutines:count::"},
+				{Name: "__service_name__", Value: "pyroscope"},
+				{Name: "__type__", Value: "goroutines"},
+				{Name: "__unit__", Value: "count"},
+				{Name: "pyroscope_spy", Value: "gospy"},
+				{Name: "service_name", Value: "pyroscope"},
+				{Name: "target", Value: "all"},
+				{Name: "version", Value: "label-names-store-gateway-0e430f1e-WIP"},
+			}},
+			{Labels: []*typesv1.LabelPair{
+				{Name: "__delta__", Value: "false"},
+				{Name: "__name__", Value: "memory"},
+				{Name: "__profile_type__", Value: "memory:alloc_objects:count::"},
+				{Name: "__service_name__", Value: "pyroscope"},
+				{Name: "__type__", Value: "alloc_objects"},
+				{Name: "__unit__", Value: "count"},
+				{Name: "pyroscope_spy", Value: "gospy"},
+				{Name: "service_name", Value: "pyroscope"},
+				{Name: "target", Value: "all"},
+				{Name: "version", Value: "label-names-store-gateway-0e430f1e-WIP"},
+			}},
+			{Labels: []*typesv1.LabelPair{
+				{Name: "__delta__", Value: "false"},
+				{Name: "__name__", Value: "memory"},
+				{Name: "__profile_type__", Value: "memory:alloc_objects:count::"},
+				{Name: "__service_name__", Value: "simple.golang.app"},
+				{Name: "__type__", Value: "alloc_objects"},
+				{Name: "__unit__", Value: "count"},
+				{Name: "pyroscope_spy", Value: "gospy"},
+				{Name: "service_name", Value: "simple.golang.app"},
+			}},
+			{Labels: []*typesv1.LabelPair{
+				{Name: "__delta__", Value: "false"},
+				{Name: "__name__", Value: "memory"},
+				{Name: "__profile_type__", Value: "memory:alloc_space:bytes::"},
+				{Name: "__service_name__", Value: "pyroscope"},
+				{Name: "__type__", Value: "alloc_space"},
+				{Name: "__unit__", Value: "bytes"},
+				{Name: "pyroscope_spy", Value: "gospy"},
+				{Name: "service_name", Value: "pyroscope"},
+				{Name: "target", Value: "all"},
+				{Name: "version", Value: "label-names-store-gateway-0e430f1e-WIP"},
+			}},
+			{Labels: []*typesv1.LabelPair{
+				{Name: "__delta__", Value: "false"},
+				{Name: "__name__", Value: "memory"},
+				{Name: "__profile_type__", Value: "memory:alloc_space:bytes::"},
+				{Name: "__service_name__", Value: "simple.golang.app"},
+				{Name: "__type__", Value: "alloc_space"},
+				{Name: "__unit__", Value: "bytes"},
+				{Name: "pyroscope_spy", Value: "gospy"},
+				{Name: "service_name", Value: "simple.golang.app"},
+			}},
+			{Labels: []*typesv1.LabelPair{
+				{Name: "__delta__", Value: "false"},
+				{Name: "__name__", Value: "memory"},
+				{Name: "__profile_type__", Value: "memory:inuse_objects:count::"},
+				{Name: "__service_name__", Value: "pyroscope"},
+				{Name: "__type__", Value: "inuse_objects"},
+				{Name: "__unit__", Value: "count"},
+				{Name: "pyroscope_spy", Value: "gospy"},
+				{Name: "service_name", Value: "pyroscope"},
+				{Name: "target", Value: "all"},
+				{Name: "version", Value: "label-names-store-gateway-0e430f1e-WIP"},
+			}},
+			{Labels: []*typesv1.LabelPair{
+				{Name: "__delta__", Value: "false"},
+				{Name: "__name__", Value: "memory"},
+				{Name: "__profile_type__", Value: "memory:inuse_objects:count::"},
+				{Name: "__service_name__", Value: "simple.golang.app"},
+				{Name: "__type__", Value: "inuse_objects"},
+				{Name: "__unit__", Value: "count"},
+				{Name: "pyroscope_spy", Value: "gospy"},
+				{Name: "service_name", Value: "simple.golang.app"},
+			}},
+			{Labels: []*typesv1.LabelPair{
+				{Name: "__delta__", Value: "false"},
+				{Name: "__name__", Value: "memory"},
+				{Name: "__profile_type__", Value: "memory:inuse_space:bytes::"},
+				{Name: "__service_name__", Value: "pyroscope"},
+				{Name: "__type__", Value: "inuse_space"},
+				{Name: "__unit__", Value: "bytes"},
+				{Name: "pyroscope_spy", Value: "gospy"},
+				{Name: "service_name", Value: "pyroscope"},
+				{Name: "target", Value: "all"},
+				{Name: "version", Value: "label-names-store-gateway-0e430f1e-WIP"},
+			}},
+			{Labels: []*typesv1.LabelPair{
+				{Name: "__delta__", Value: "false"},
+				{Name: "__name__", Value: "memory"},
+				{Name: "__profile_type__", Value: "memory:inuse_space:bytes::"},
+				{Name: "__service_name__", Value: "simple.golang.app"},
+				{Name: "__type__", Value: "inuse_space"},
+				{Name: "__unit__", Value: "bytes"},
+				{Name: "pyroscope_spy", Value: "gospy"},
+				{Name: "service_name", Value: "simple.golang.app"},
+			}},
+			{Labels: []*typesv1.LabelPair{
+				{Name: "__delta__", Value: "false"},
+				{Name: "__name__", Value: "mutex"},
+				{Name: "__profile_type__", Value: "mutex:contentions:count::"},
+				{Name: "__service_name__", Value: "pyroscope"},
+				{Name: "__type__", Value: "contentions"},
+				{Name: "__unit__", Value: "count"},
+				{Name: "pyroscope_spy", Value: "gospy"},
+				{Name: "service_name", Value: "pyroscope"},
+				{Name: "target", Value: "all"},
+				{Name: "version", Value: "label-names-store-gateway-0e430f1e-WIP"},
+			}},
+			{Labels: []*typesv1.LabelPair{
+				{Name: "__delta__", Value: "false"},
+				{Name: "__name__", Value: "mutex"},
+				{Name: "__profile_type__", Value: "mutex:delay:nanoseconds::"},
+				{Name: "__service_name__", Value: "pyroscope"},
+				{Name: "__type__", Value: "delay"},
+				{Name: "__unit__", Value: "nanoseconds"},
+				{Name: "pyroscope_spy", Value: "gospy"},
+				{Name: "service_name", Value: "pyroscope"},
+				{Name: "target", Value: "all"},
+				{Name: "version", Value: "label-names-store-gateway-0e430f1e-WIP"},
+			}},
+			{Labels: []*typesv1.LabelPair{
+				{Name: "__delta__", Value: "false"},
+				{Name: "__name__", Value: "process_cpu"},
+				{Name: "__period_type__", Value: "cpu"},
+				{Name: "__period_unit__", Value: "nanoseconds"},
+				{Name: "__profile_type__", Value: "process_cpu:cpu:nanoseconds:cpu:nanoseconds"},
+				{Name: "__service_name__", Value: "pyroscope"},
+				{Name: "__type__", Value: "cpu"},
+				{Name: "__unit__", Value: "nanoseconds"},
+				{Name: "pyroscope_spy", Value: "gospy"},
+				{Name: "service_name", Value: "pyroscope"},
+				{Name: "target", Value: "all"},
+				{Name: "version", Value: "label-names-store-gateway-0e430f1e-WIP"},
+			}},
+			{Labels: []*typesv1.LabelPair{
+				{Name: "__delta__", Value: "false"},
+				{Name: "__name__", Value: "process_cpu"},
+				{Name: "__period_type__", Value: "cpu"},
+				{Name: "__period_unit__", Value: "nanoseconds"},
+				{Name: "__profile_type__", Value: "process_cpu:cpu:nanoseconds:cpu:nanoseconds"},
+				{Name: "__service_name__", Value: "simple.golang.app"},
+				{Name: "__type__", Value: "cpu"},
+				{Name: "__unit__", Value: "nanoseconds"},
+				{Name: "foo", Value: "bar"},
+				{Name: "function", Value: "fast"},
+				{Name: "pyroscope_spy", Value: "gospy"},
+				{Name: "service_name", Value: "simple.golang.app"},
+			}},
+			{Labels: []*typesv1.LabelPair{
+				{Name: "__delta__", Value: "false"},
+				{Name: "__name__", Value: "process_cpu"},
+				{Name: "__period_type__", Value: "cpu"},
+				{Name: "__period_unit__", Value: "nanoseconds"},
+				{Name: "__profile_type__", Value: "process_cpu:cpu:nanoseconds:cpu:nanoseconds"},
+				{Name: "__service_name__", Value: "simple.golang.app"},
+				{Name: "__type__", Value: "cpu"},
+				{Name: "__unit__", Value: "nanoseconds"},
+				{Name: "foo", Value: "bar"},
+				{Name: "function", Value: "slow"},
+				{Name: "pyroscope_spy", Value: "gospy"},
+				{Name: "service_name", Value: "simple.golang.app"},
+			}},
+			{Labels: []*typesv1.LabelPair{
+				{Name: "__delta__", Value: "false"},
+				{Name: "__name__", Value: "process_cpu"},
+				{Name: "__period_type__", Value: "cpu"},
+				{Name: "__period_unit__", Value: "nanoseconds"},
+				{Name: "__profile_type__", Value: "process_cpu:cpu:nanoseconds:cpu:nanoseconds"},
+				{Name: "__service_name__", Value: "simple.golang.app"},
+				{Name: "__type__", Value: "cpu"},
+				{Name: "__unit__", Value: "nanoseconds"},
+				{Name: "foo", Value: "bar"},
+				{Name: "pyroscope_spy", Value: "gospy"},
+				{Name: "service_name", Value: "simple.golang.app"},
+			}},
+			{Labels: []*typesv1.LabelPair{
+				{Name: "__delta__", Value: "false"},
+				{Name: "__name__", Value: "process_cpu"},
+				{Name: "__period_type__", Value: "cpu"},
+				{Name: "__period_unit__", Value: "nanoseconds"},
+				{Name: "__profile_type__", Value: "process_cpu:cpu:nanoseconds:cpu:nanoseconds"},
+				{Name: "__service_name__", Value: "simple.golang.app"},
+				{Name: "__type__", Value: "cpu"},
+				{Name: "__unit__", Value: "nanoseconds"},
+				{Name: "pyroscope_spy", Value: "gospy"},
+				{Name: "service_name", Value: "simple.golang.app"},
+			}},
+		}
+		got, err := q.Series(ctx, &ingestv1.SeriesRequest{
+			Matchers:   []string{},
+			LabelNames: []string{},
+		})
+
+		assert.NoError(t, err)
+		assert.Equal(t, want, got)
+	})
+
+	t.Run("ui plugin", func(t *testing.T) {
+		want := []*typesv1.Labels{
+			{Labels: []*typesv1.LabelPair{
+				{Name: "__name__", Value: "block"},
+				{Name: "__profile_type__", Value: "block:contentions:count::"},
+				{Name: "__type__", Value: "contentions"},
+				{Name: "service_name", Value: "pyroscope"},
+			}},
+			{Labels: []*typesv1.LabelPair{
+				{Name: "__name__", Value: "block"},
+				{Name: "__profile_type__", Value: "block:delay:nanoseconds::"},
+				{Name: "__type__", Value: "delay"},
+				{Name: "service_name", Value: "pyroscope"},
+			}},
+			{Labels: []*typesv1.LabelPair{
+				{Name: "__name__", Value: "goroutine"},
+				{Name: "__profile_type__", Value: "goroutine:goroutines:count::"},
+				{Name: "__type__", Value: "goroutines"},
+				{Name: "service_name", Value: "pyroscope"},
+			}},
+			{Labels: []*typesv1.LabelPair{
+				{Name: "__name__", Value: "memory"},
+				{Name: "__profile_type__", Value: "memory:alloc_objects:count::"},
+				{Name: "__type__", Value: "alloc_objects"},
+				{Name: "service_name", Value: "pyroscope"},
+			}},
+			{Labels: []*typesv1.LabelPair{
+				{Name: "__name__", Value: "memory"},
+				{Name: "__profile_type__", Value: "memory:alloc_objects:count::"},
+				{Name: "__type__", Value: "alloc_objects"},
+				{Name: "service_name", Value: "simple.golang.app"},
+			}},
+			{Labels: []*typesv1.LabelPair{
+				{Name: "__name__", Value: "memory"},
+				{Name: "__profile_type__", Value: "memory:alloc_space:bytes::"},
+				{Name: "__type__", Value: "alloc_space"},
+				{Name: "service_name", Value: "pyroscope"},
+			}},
+			{Labels: []*typesv1.LabelPair{
+				{Name: "__name__", Value: "memory"},
+				{Name: "__profile_type__", Value: "memory:alloc_space:bytes::"},
+				{Name: "__type__", Value: "alloc_space"},
+				{Name: "service_name", Value: "simple.golang.app"},
+			}},
+			{Labels: []*typesv1.LabelPair{
+				{Name: "__name__", Value: "memory"},
+				{Name: "__profile_type__", Value: "memory:inuse_objects:count::"},
+				{Name: "__type__", Value: "inuse_objects"},
+				{Name: "service_name", Value: "pyroscope"},
+			}},
+			{Labels: []*typesv1.LabelPair{
+				{Name: "__name__", Value: "memory"},
+				{Name: "__profile_type__", Value: "memory:inuse_objects:count::"},
+				{Name: "__type__", Value: "inuse_objects"},
+				{Name: "service_name", Value: "simple.golang.app"},
+			}},
+			{Labels: []*typesv1.LabelPair{
+				{Name: "__name__", Value: "memory"},
+				{Name: "__profile_type__", Value: "memory:inuse_space:bytes::"},
+				{Name: "__type__", Value: "inuse_space"},
+				{Name: "service_name", Value: "pyroscope"},
+			}},
+			{Labels: []*typesv1.LabelPair{
+				{Name: "__name__", Value: "memory"},
+				{Name: "__profile_type__", Value: "memory:inuse_space:bytes::"},
+				{Name: "__type__", Value: "inuse_space"},
+				{Name: "service_name", Value: "simple.golang.app"},
+			}},
+			{Labels: []*typesv1.LabelPair{
+				{Name: "__name__", Value: "mutex"},
+				{Name: "__profile_type__", Value: "mutex:contentions:count::"},
+				{Name: "__type__", Value: "contentions"},
+				{Name: "service_name", Value: "pyroscope"},
+			}},
+			{Labels: []*typesv1.LabelPair{
+				{Name: "__name__", Value: "mutex"},
+				{Name: "__profile_type__", Value: "mutex:delay:nanoseconds::"},
+				{Name: "__type__", Value: "delay"},
+				{Name: "service_name", Value: "pyroscope"},
+			}},
+			{Labels: []*typesv1.LabelPair{
+				{Name: "__name__", Value: "process_cpu"},
+				{Name: "__profile_type__", Value: "process_cpu:cpu:nanoseconds:cpu:nanoseconds"},
+				{Name: "__type__", Value: "cpu"},
+				{Name: "service_name", Value: "pyroscope"},
+			}},
+			{Labels: []*typesv1.LabelPair{
+				{Name: "__name__", Value: "process_cpu"},
+				{Name: "__profile_type__", Value: "process_cpu:cpu:nanoseconds:cpu:nanoseconds"},
+				{Name: "__type__", Value: "cpu"},
+				{Name: "service_name", Value: "simple.golang.app"},
+			}},
+		}
+		got, err := q.Series(ctx, &ingestv1.SeriesRequest{
+			Matchers: []string{},
+			LabelNames: []string{
+				"pyroscope_app",
+				"service_name",
+				"__profile_type__",
+				"__type__",
+				"__name__",
+			},
+		})
+
+		assert.NoError(t, err)
+		assert.Equal(t, want, got)
+	})
+}
+
+func Test_singleBlockQuerier_LabelNames(t *testing.T) {
+	ctx := context.Background()
+	reader, err := index.NewFileReader("testdata/01HA2V3CPSZ9E0HMQNNHH89WSS/index.tsdb")
+	assert.NoError(t, err)
+
+	q := &singleBlockQuerier{
+		metrics: newBlocksMetrics(nil),
+		meta:    &block.Meta{ULID: ulid.MustParse("01HA2V3CPSZ9E0HMQNNHH89WSS")},
+		opened:  true, // Skip trying to open the block.
+		index:   reader,
+	}
+
+	t.Run("no matchers", func(t *testing.T) {
+		want := []string{
+			"__delta__",
+			"__name__",
+			"__period_type__",
+			"__period_unit__",
+			"__profile_type__",
+			"__service_name__",
+			"__type__",
+			"__unit__",
+			"foo",
+			"function",
+			"pyroscope_spy",
+			"service_name",
+			"target",
+			"version",
+		}
+
+		got, err := q.LabelNames(ctx, connect.NewRequest(&typesv1.LabelNamesRequest{
+			Matchers: []string{},
+		}))
+		assert.NoError(t, err)
+		assert.Equal(t, want, got.Msg.Names)
+	})
+
+	t.Run("empty matcher", func(t *testing.T) {
+		want := []string{
+			"__delta__",
+			"__name__",
+			"__period_type__",
+			"__period_unit__",
+			"__profile_type__",
+			"__service_name__",
+			"__type__",
+			"__unit__",
+			"foo",
+			"function",
+			"pyroscope_spy",
+			"service_name",
+			"target",
+			"version",
+		}
+
+		got, err := q.LabelNames(ctx, connect.NewRequest(&typesv1.LabelNamesRequest{
+			Matchers: []string{`{}`},
+		}))
+		assert.NoError(t, err)
+		assert.Equal(t, want, got.Msg.Names)
+	})
+
+	t.Run("single matcher", func(t *testing.T) {
+		want := []string{
+			"__delta__",
+			"__name__",
+			"__period_type__",
+			"__period_unit__",
+			"__profile_type__",
+			"__service_name__",
+			"__type__",
+			"__unit__",
+			"foo",
+			"function",
+			"pyroscope_spy",
+			"service_name",
+			"target",
+			"version",
+		}
+
+		got, err := q.LabelNames(ctx, connect.NewRequest(&typesv1.LabelNamesRequest{
+			Matchers: []string{`{__name__="process_cpu"}`},
+		}))
+		assert.NoError(t, err)
+		assert.Equal(t, want, got.Msg.Names)
+	})
+
+	t.Run("multiple matchers", func(t *testing.T) {
+		want := []string{
+			"__delta__",
+			"__name__",
+			"__profile_type__",
+			"__service_name__",
+			"__type__",
+			"__unit__",
+			"pyroscope_spy",
+			"service_name",
+			"target",
+			"version",
+		}
+
+		got, err := q.LabelNames(ctx, connect.NewRequest(&typesv1.LabelNamesRequest{
+			Matchers: []string{`{__name__="memory",__type__="alloc_objects"}`},
+		}))
+		assert.NoError(t, err)
+		assert.Equal(t, want, got.Msg.Names)
+	})
+
+	t.Run("ui plugin", func(t *testing.T) {
+		want := []string{
+			"__delta__",
+			"__name__",
+			"__period_type__",
+			"__period_unit__",
+			"__profile_type__",
+			"__service_name__",
+			"__type__",
+			"__unit__",
+			"foo",
+			"function",
+			"pyroscope_spy",
+			"service_name",
+		}
+
+		got, err := q.LabelNames(ctx, connect.NewRequest(&typesv1.LabelNamesRequest{
+			Matchers: []string{`{__profile_type__="process_cpu:cpu:nanoseconds:cpu:nanoseconds"}`, `{service_name="simple.golang.app"}`},
+		}))
+		assert.NoError(t, err)
+		assert.Equal(t, want, got.Msg.Names)
+	})
+}
+
+func Test_singleBlockQuerier_LabelValues(t *testing.T) {
+	ctx := context.Background()
+	reader, err := index.NewFileReader("testdata/01HA2V3CPSZ9E0HMQNNHH89WSS/index.tsdb")
+	assert.NoError(t, err)
+
+	q := &singleBlockQuerier{
+		metrics: newBlocksMetrics(nil),
+		meta:    &block.Meta{ULID: ulid.MustParse("01HA2V3CPSZ9E0HMQNNHH89WSS")},
+		opened:  true, // Skip trying to open the block.
+		index:   reader,
+	}
+
+	t.Run("no matchers", func(t *testing.T) {
+		want := []string{
+			"pyroscope",
+			"simple.golang.app",
+		}
+
+		got, err := q.LabelValues(ctx, connect.NewRequest(&typesv1.LabelValuesRequest{
+			Matchers: []string{},
+			Name:     "service_name",
+		}))
+		assert.NoError(t, err)
+		assert.Equal(t, want, got.Msg.Names)
+	})
+
+	t.Run("empty matcher", func(t *testing.T) {
+		want := []string{
+			"pyroscope",
+			"simple.golang.app",
+		}
+
+		got, err := q.LabelValues(ctx, connect.NewRequest(&typesv1.LabelValuesRequest{
+			Matchers: []string{`{}`},
+			Name:     "service_name",
+		}))
+		assert.NoError(t, err)
+		assert.Equal(t, want, got.Msg.Names)
+	})
+
+	t.Run("single matcher", func(t *testing.T) {
+		want := []string{
+			"fast",
+			"slow",
+		}
+
+		got, err := q.LabelValues(ctx, connect.NewRequest(&typesv1.LabelValuesRequest{
+			Matchers: []string{`{service_name="simple.golang.app"}`},
+			Name:     "function",
+		}))
+		assert.NoError(t, err)
+		assert.Equal(t, want, got.Msg.Names)
+
+		// Pyroscope app shouldn't have any function label values.
+		got, err = q.LabelValues(ctx, connect.NewRequest(&typesv1.LabelValuesRequest{
+			Matchers: []string{`{service_name="pyroscope"}`},
+			Name:     "function",
+		}))
+		assert.NoError(t, err)
+		assert.Empty(t, got.Msg.Names)
+	})
+
+	t.Run("multiple matchers", func(t *testing.T) {
+		want := []string{
+			"fast",
+			"slow",
+		}
+
+		got, err := q.LabelValues(ctx, connect.NewRequest(&typesv1.LabelValuesRequest{
+			Matchers: []string{`{__profile_type__="process_cpu:cpu:nanoseconds:cpu:nanoseconds", service_name="simple.golang.app"}`},
+			Name:     "function",
+		}))
+		assert.NoError(t, err)
+		assert.Equal(t, want, got.Msg.Names)
+
+		// Memory profiles shouldn't have 'function' label values.
+		got, err = q.LabelValues(ctx, connect.NewRequest(&typesv1.LabelValuesRequest{
+
+			Matchers: []string{`{__profile_type__="memory:alloc_objects:count:space:bytes", service_name="simple.golang.app"}`},
+			Name:     "function",
+		}))
+		assert.NoError(t, err)
+		assert.Empty(t, got.Msg.Names)
+	})
+
+	t.Run("ui plugin", func(t *testing.T) {
+		want := []string{
+			"fast",
+			"slow",
+		}
+
+		got, err := q.LabelValues(ctx, connect.NewRequest(&typesv1.LabelValuesRequest{
+			Matchers: []string{`{__profile_type__="process_cpu:cpu:nanoseconds:cpu:nanoseconds", service_name="simple.golang.app"}`},
+			Name:     "function",
+		}))
+		assert.NoError(t, err)
+		assert.Equal(t, want, got.Msg.Names)
+	})
+}
+
+func Test_singleBlockQuerier_ProfileTypes(t *testing.T) {
+	ctx := context.Background()
+	reader, err := index.NewFileReader("testdata/01HA2V3CPSZ9E0HMQNNHH89WSS/index.tsdb")
+	assert.NoError(t, err)
+
+	q := &singleBlockQuerier{
+		metrics: newBlocksMetrics(nil),
+		meta:    &block.Meta{ULID: ulid.MustParse("01HA2V3CPSZ9E0HMQNNHH89WSS")},
+		opened:  true, // Skip trying to open the block.
+		index:   reader,
+	}
+
+	want := []*typesv1.ProfileType{
+		{
+			ID:         "block:contentions:count::",
+			Name:       "block",
+			SampleType: "contentions",
+			SampleUnit: "count",
+			PeriodType: "",
+			PeriodUnit: "",
+		},
+		{
+			ID:         "block:delay:nanoseconds::",
+			Name:       "block",
+			SampleType: "delay",
+			SampleUnit: "nanoseconds",
+			PeriodType: "",
+			PeriodUnit: "",
+		},
+		{
+			ID:         "goroutine:goroutines:count::",
+			Name:       "goroutine",
+			SampleType: "goroutines",
+			SampleUnit: "count",
+			PeriodType: "",
+			PeriodUnit: "",
+		},
+		{
+			ID:         "memory:alloc_objects:count::",
+			Name:       "memory",
+			SampleType: "alloc_objects",
+			SampleUnit: "count",
+			PeriodType: "",
+			PeriodUnit: "",
+		},
+		{
+			ID:         "memory:alloc_space:bytes::",
+			Name:       "memory",
+			SampleType: "alloc_space",
+			SampleUnit: "bytes",
+			PeriodType: "",
+			PeriodUnit: "",
+		},
+		{
+			ID:         "memory:inuse_objects:count::",
+			Name:       "memory",
+			SampleType: "inuse_objects",
+			SampleUnit: "count",
+			PeriodType: "",
+			PeriodUnit: "",
+		},
+		{
+			ID:         "memory:inuse_space:bytes::",
+			Name:       "memory",
+			SampleType: "inuse_space",
+			SampleUnit: "bytes",
+			PeriodType: "",
+			PeriodUnit: "",
+		},
+		{
+			ID:         "mutex:contentions:count::",
+			Name:       "mutex",
+			SampleType: "contentions",
+			SampleUnit: "count",
+			PeriodType: "",
+			PeriodUnit: "",
+		},
+		{
+			ID:         "mutex:delay:nanoseconds::",
+			Name:       "mutex",
+			SampleType: "delay",
+			SampleUnit: "nanoseconds",
+			PeriodType: "",
+			PeriodUnit: "",
+		},
+		{
+			ID:         "process_cpu:cpu:nanoseconds:cpu:nanoseconds",
+			Name:       "process_cpu",
+			SampleType: "cpu",
+			SampleUnit: "nanoseconds",
+			PeriodType: "cpu",
+			PeriodUnit: "nanoseconds",
+		},
+	}
+
+	got, err := q.ProfileTypes(ctx, &connect.Request[ingestv1.ProfileTypesRequest]{})
+	assert.NoError(t, err)
+	assert.Equal(t, want, got.Msg.ProfileTypes)
+}
+
+func Benchmark_singleBlockQuerier_Series(b *testing.B) {
+	ctx := context.Background()
+	reader, err := index.NewFileReader("testdata/01HA2V3CPSZ9E0HMQNNHH89WSS/index.tsdb")
+	assert.NoError(b, err)
+
+	q := &singleBlockQuerier{
+		metrics: newBlocksMetrics(nil),
+		meta:    &block.Meta{ULID: ulid.MustParse("01HA2V3CPSZ9E0HMQNNHH89WSS")},
+		opened:  true, // Skip trying to open the block.
+		index:   reader,
+	}
+
+	b.Run("multiple labels", func(b *testing.B) {
+		for n := 0; n < b.N; n++ {
+			q.Series(ctx, &ingestv1.SeriesRequest{ //nolint:errcheck
+				Matchers:   []string{`{__name__="block"}`},
+				LabelNames: []string{"__name__"},
+			})
+		}
+	})
+
+	b.Run("multiple labels with matcher", func(b *testing.B) {
+		for n := 0; n < b.N; n++ {
+			q.Series(ctx, &ingestv1.SeriesRequest{ //nolint:errcheck
+				Matchers:   []string{`{__name__="memory",__type__="alloc_objects"}`},
+				LabelNames: []string{"__name__", "__type__"},
+			})
+		}
+	})
+}
+
+func Benchmark_singleBlockQuerier_LabelNames(b *testing.B) {
+	ctx := context.Background()
+	reader, err := index.NewFileReader("testdata/01HA2V3CPSZ9E0HMQNNHH89WSS/index.tsdb")
+	assert.NoError(b, err)
+
+	q := &singleBlockQuerier{
+		metrics: newBlocksMetrics(nil),
+		meta:    &block.Meta{ULID: ulid.MustParse("01HA2V3CPSZ9E0HMQNNHH89WSS")},
+		opened:  true, // Skip trying to open the block.
+		index:   reader,
+	}
+
+	b.Run("multiple matchers", func(b *testing.B) {
+		for n := 0; n < b.N; n++ {
+			q.LabelNames(ctx, connect.NewRequest(&typesv1.LabelNamesRequest{ //nolint:errcheck
+				Matchers: []string{`{__profile_type__="process_cpu:cpu:nanoseconds:cpu:nanoseconds"}`, `{service_name="simple.golang.app"}`},
+			}))
+		}
+	})
 }

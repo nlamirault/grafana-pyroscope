@@ -8,11 +8,7 @@ import {
 import { Result } from '@pyroscope/util/fp';
 import { z, ZodError } from 'zod';
 import type { RequestError } from '@pyroscope/services/base';
-import {
-  parseResponse,
-  request,
-  requestWithOrgID,
-} from '@pyroscope/services/base';
+import { parseResponse, request } from '@pyroscope/services/base';
 
 // SeriesResponse refers to the response from the server, without any manipulation
 const SeriesResponseSchema = z.preprocess(
@@ -82,10 +78,11 @@ function removeDuplicateApps(app: App[]) {
   });
 }
 
-export async function fetchApps(): Promise<
-  Result<App[], RequestError | ZodError>
-> {
-  let response = await requestWithOrgID('/querier.v1.QuerierService/Series', {
+export async function fetchApps(
+  fromMs?: number,
+  untilMs?: number
+): Promise<Result<App[], RequestError | ZodError>> {
+  let response = await request('/querier.v1.QuerierService/Series', {
     method: 'POST',
     body: JSON.stringify({
       matchers: [],
@@ -96,6 +93,8 @@ export async function fetchApps(): Promise<
         '__type__',
         '__name__',
       ],
+      start: fromMs || 0,
+      end: untilMs || 0,
     }),
     headers: {
       'content-type': 'application/json',
@@ -107,10 +106,12 @@ export async function fetchApps(): Promise<
   }
 
   // try without labelNames in case of an error since this has been added in a later version
-  response = await requestWithOrgID('/querier.v1.QuerierService/Series', {
+  response = await request('/querier.v1.QuerierService/Series', {
     method: 'POST',
     body: JSON.stringify({
       matchers: [],
+      start: fromMs,
+      end: untilMs,
     }),
     headers: {
       'content-type': 'application/json',

@@ -70,12 +70,13 @@ type Head struct {
 	tables        []Table
 	delta         *deltaProfiles
 
-	limiter TenantLimiter
+	limiter   TenantLimiter
+	updatedAt *atomic.Time
 }
 
 const (
 	pathHead          = "head"
-	pathLocal         = "local"
+	PathLocal         = "local"
 	defaultFolderMode = 0o755
 )
 
@@ -93,9 +94,10 @@ func NewHead(phlarectx context.Context, cfg Config, limiter TenantLimiter) (*Hea
 
 		parquetConfig: &parquetConfig,
 		limiter:       limiter,
+		updatedAt:     atomic.NewTime(time.Now()),
 	}
 	h.headPath = filepath.Join(cfg.DataPath, pathHead, h.meta.ULID.String())
-	h.localPath = filepath.Join(cfg.DataPath, pathLocal, h.meta.ULID.String())
+	h.localPath = filepath.Join(cfg.DataPath, PathLocal, h.meta.ULID.String())
 
 	if cfg.Parquet != nil {
 		h.parquetConfig = cfg.Parquet
@@ -161,7 +163,26 @@ func (h *Head) loop() {
 	}
 }
 
+const StaleGracePeriod = 5 * time.Minute
+
+// isStale returns true if the head is stale and should be flushed.
+// The head is stale if it is older than the max time of the block provided as maxT.
+// And if the head has not been updated for 5 minutes.
+func (h *Head) isStale(maxT int64, now time.Time) bool {
+	// If we're still receiving data we'll wait 5 minutes before flushing.
+	if now.Sub(h.updatedAt.Load()) <= StaleGracePeriod {
+		return false
+	}
+	// Blocks that have pass their maxT range by 5min are stale
+	return now.After(time.Unix(0, maxT))
+}
+
 func (h *Head) Ingest(ctx context.Context, p *profilev1.Profile, id uuid.UUID, externalLabels ...*typesv1.LabelPair) error {
+	if len(p.Sample) == 0 {
+		level.Debug(h.logger).Log("msg", "profile has no samples", "labels", externalLabels)
+		return nil
+	}
+
 	labels, seriesFingerprints := labelsForProfile(p, externalLabels...)
 
 	for i, fp := range seriesFingerprints {
@@ -210,6 +231,8 @@ func (h *Head) Ingest(ctx context.Context, p *profilev1.Profile, id uuid.UUID, e
 		h.meta.MaxTime = v
 	}
 	h.metaLock.Unlock()
+
+	h.updatedAt.Store(time.Now())
 
 	return nil
 }
@@ -304,6 +327,10 @@ func (h *Head) ProfileTypes(ctx context.Context, req *connect.Request[ingestv1.P
 	return connect.NewResponse(&ingestv1.ProfileTypesResponse{
 		ProfileTypes: profileTypes,
 	}), nil
+}
+
+func (h *Head) BlockID() string {
+	return h.meta.ULID.String()
 }
 
 func (h *Head) Bounds() (mint, maxt model.Time) {
@@ -446,7 +473,6 @@ func (h *Head) Series(ctx context.Context, req *connect.Request[ingestv1.SeriesR
 		if len(req.Msg.LabelNames) > 0 {
 			lbs = lbs.WithLabels(req.Msg.LabelNames...)
 			fp = model.Fingerprint(lbs.Hash())
-
 		}
 
 		if _, ok := uniqu[fp]; ok {
@@ -462,6 +488,7 @@ func (h *Head) Series(ctx context.Context, req *connect.Request[ingestv1.SeriesR
 	sort.Slice(response.LabelsSet, func(i, j int) bool {
 		return phlaremodel.CompareLabelPairs(response.LabelsSet[i].Labels, response.LabelsSet[j].Labels) < 0
 	})
+
 	return connect.NewResponse(response), nil
 }
 
@@ -488,7 +515,7 @@ func (h *Head) flush(ctx context.Context) error {
 	// It must be guaranteed that no new inserts will happen
 	// after the call start.
 	h.inFlightProfiles.Wait()
-	if len(h.profiles.slice) == 0 {
+	if h.profiles.index.totalProfiles.Load() == 0 {
 		level.Info(h.logger).Log("msg", "head empty - no block written")
 		return os.RemoveAll(h.headPath)
 	}

@@ -2,11 +2,8 @@ package symdb
 
 import (
 	"context"
-	"hash/maphash"
 	"io"
-	"reflect"
 	"sync"
-	"unsafe"
 
 	schemav1 "github.com/grafana/pyroscope/pkg/phlaredb/schemas/v1"
 )
@@ -28,6 +25,9 @@ func (p *PartitionWriter) AppendStacktraces(dst []uint32, s []*schemav1.Stacktra
 func (p *PartitionWriter) ResolveStacktraceLocations(_ context.Context, dst StacktraceInserter, stacktraces []uint32) error {
 	// TODO(kolesnikovae): Add option to do resolve concurrently.
 	//   Depends on StacktraceInserter implementation.
+	if len(stacktraces) == 0 {
+		return nil
+	}
 	return p.stacktraces.resolve(dst, stacktraces)
 }
 
@@ -99,20 +99,6 @@ func (p *stacktracesPartition) stacktraceChunkForRead(i int) (*stacktraceChunk, 
 func (p *stacktracesPartition) currentStacktraceChunk() *stacktraceChunk {
 	// Assuming there is at least one chunk.
 	return p.chunks[len(p.chunks)-1]
-}
-
-var seed = maphash.MakeSeed()
-
-func hashLocations(s []uint64) uint64 {
-	if len(s) == 0 {
-		return 0
-	}
-	var b []byte
-	hdr := (*reflect.SliceHeader)(unsafe.Pointer(&b))
-	hdr.Len = len(s) * 8
-	hdr.Cap = hdr.Len
-	hdr.Data = uintptr(unsafe.Pointer(&s[0]))
-	return maphash.Bytes(seed, b)
 }
 
 func (p *stacktracesPartition) append(dst []uint32, s []*schemav1.Stacktrace) {

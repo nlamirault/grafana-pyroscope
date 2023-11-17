@@ -66,7 +66,7 @@ func testContext(t testing.TB) testCtx {
 	dataPath := t.TempDir()
 	ctx = contextWithDataDir(ctx, dataPath)
 	bucketCfg := phlareobjclient.Config{}
-	bucketCfg.Backend = "filesystem"
+	bucketCfg.Backend = phlareobjclient.Filesystem
 	bucketCfg.Filesystem.Directory = dataPath
 	bucketClient, err := phlareobjclient.NewBucket(ctx, bucketCfg, "testing")
 	require.NoError(t, err)
@@ -594,4 +594,16 @@ func TestProfileStore_Querying(t *testing.T) {
 			values,
 		)
 	})
+}
+
+func TestRemoveFailedSegment(t *testing.T) {
+	store := newProfileStore(testContext(t))
+	dir := t.TempDir()
+	require.NoError(t, store.Init(dir, defaultParquetConfig, contextHeadMetrics(context.Background())))
+	// fake a failed segment
+	_, err := os.Create(dir + "/profiles.0.parquet")
+	require.NoError(t, store.ingest(context.Background(), []schemav1.InMemoryProfile{{}}, phlaremodel.LabelsFromStrings(), "memory"))
+	require.NoError(t, err)
+	err = store.cutRowGroup(1)
+	require.NoError(t, err)
 }

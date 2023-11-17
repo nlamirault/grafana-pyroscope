@@ -3,6 +3,8 @@
 # Declare variables to be passed into your templates.
 
 pyroscope:
+  extraArgs:
+    store-gateway.sharding-ring.replication-factor: "3"
   components:
     querier:
       kind: Deployment
@@ -44,6 +46,17 @@ pyroscope:
       kind: StatefulSet
       replicaCount: 3
       terminationGracePeriodSeconds: 600
+      resources:
+        limits:
+          memory: 16Gi
+        requests:
+          memory: 8Gi
+          cpu: 1
+    compactor:
+      kind: StatefulSet
+      replicaCount: 3
+      persistence:
+        enabled: false
       resources:
         limits:
           memory: 16Gi

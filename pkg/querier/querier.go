@@ -3,8 +3,10 @@ package querier
 import (
 	"context"
 	"flag"
+	"fmt"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/bufbuild/connect-go"
@@ -21,6 +23,7 @@ import (
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/promql/parser"
 	"github.com/samber/lo"
+	"golang.org/x/exp/slices"
 	"golang.org/x/sync/errgroup"
 
 	googlev1 "github.com/grafana/pyroscope/api/gen/proto/go/google/v1"
@@ -30,7 +33,7 @@ import (
 	"github.com/grafana/pyroscope/pkg/clientpool"
 	"github.com/grafana/pyroscope/pkg/iter"
 	phlaremodel "github.com/grafana/pyroscope/pkg/model"
-	"github.com/grafana/pyroscope/pkg/util"
+	"github.com/grafana/pyroscope/pkg/pprof"
 	"github.com/grafana/pyroscope/pkg/util/math"
 	"github.com/grafana/pyroscope/pkg/util/spanlogger"
 )
@@ -58,6 +61,11 @@ type Querier struct {
 	storeGatewayQuerier *StoreGatewayQuerier
 }
 
+// TODO(kolesnikovae): For backwards compatibility.
+// Should be removed in the next release.
+//
+// The default value should never be used in practice:
+// querier frontend sets the limit.
 const maxNodesDefault = int64(2048)
 
 func New(cfg Config, ingestersRing ring.ReadRing, factory ring_client.PoolFactory, storeGatewayQuerier *StoreGatewayQuerier, reg prometheus.Registerer, logger log.Logger, clientsOptions ...connect.ClientOption) (*Querier, error) {
@@ -115,54 +123,143 @@ func (q *Querier) ProfileTypes(ctx context.Context, req *connect.Request[querier
 	sp, ctx := opentracing.StartSpanFromContext(ctx, "ProfileTypes")
 	defer sp.Finish()
 
-	responses, err := forAllIngesters(ctx, q.ingesterQuerier, func(childCtx context.Context, ic IngesterQueryClient) ([]*typesv1.ProfileType, error) {
-		res, err := ic.ProfileTypes(childCtx, connect.NewRequest(&ingestv1.ProfileTypesRequest{}))
+	_, hasTimeRange := phlaremodel.GetTimeRange(req.Msg)
+	sp.LogFields(
+		otlog.Bool("legacy_request", !hasTimeRange),
+		otlog.Int64("start", req.Msg.Start),
+		otlog.Int64("end", req.Msg.End),
+	)
+
+	if q.storeGatewayQuerier == nil || !hasTimeRange {
+		responses, err := q.profileTypesFromIngesters(ctx, &ingestv1.ProfileTypesRequest{
+			Start: req.Msg.Start,
+			End:   req.Msg.End,
+		})
 		if err != nil {
 			return nil, err
 		}
-		return res.Msg.ProfileTypes, nil
-	})
+
+		return connect.NewResponse(&querierv1.ProfileTypesResponse{
+			ProfileTypes: uniqueSortedProfileTypes(responses),
+		}), nil
+	}
+
+	storeQueries := splitQueryToStores(model.Time(req.Msg.Start), model.Time(req.Msg.End), model.Now(), q.cfg.QueryStoreAfter, nil)
+	if !storeQueries.ingester.shouldQuery && !storeQueries.storeGateway.shouldQuery {
+		return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("start and end time are outside of the ingester and store gateway retention"))
+	}
+	storeQueries.Log(level.Debug(spanlogger.FromContext(ctx, q.logger)))
+
+	var responses []ResponseFromReplica[*ingestv1.ProfileTypesResponse]
+	var lock sync.Mutex
+	group, ctx := errgroup.WithContext(ctx)
+
+	if storeQueries.ingester.shouldQuery {
+		group.Go(func() error {
+			ir, err := q.profileTypesFromIngesters(ctx, &ingestv1.ProfileTypesRequest{
+				Start: req.Msg.Start,
+				End:   req.Msg.End,
+			})
+			if err != nil {
+				return err
+			}
+
+			lock.Lock()
+			responses = append(responses, ir...)
+			lock.Unlock()
+			return nil
+		})
+	}
+
+	if storeQueries.storeGateway.shouldQuery {
+		group.Go(func() error {
+			ir, err := q.profileTypesFromStoreGateway(ctx, &ingestv1.ProfileTypesRequest{
+				Start: req.Msg.Start,
+				End:   req.Msg.End,
+			})
+			if err != nil {
+				return err
+			}
+
+			lock.Lock()
+			responses = append(responses, ir...)
+			lock.Unlock()
+			return nil
+		})
+	}
+
+	err := group.Wait()
 	if err != nil {
 		return nil, err
 	}
-	var profileTypeIDs []string
-	profileTypes := make(map[string]*typesv1.ProfileType)
-	for _, response := range responses {
-		for _, profileType := range response.response {
-			if _, ok := profileTypes[profileType.ID]; !ok {
-				profileTypeIDs = append(profileTypeIDs, profileType.ID)
-				profileTypes[profileType.ID] = profileType
-			}
-		}
-	}
-	sort.Strings(profileTypeIDs)
-	result := &querierv1.ProfileTypesResponse{
-		ProfileTypes: make([]*typesv1.ProfileType, 0, len(profileTypes)),
-	}
-	for _, id := range profileTypeIDs {
-		result.ProfileTypes = append(result.ProfileTypes, profileTypes[id])
-	}
-	return connect.NewResponse(result), nil
+
+	return connect.NewResponse(&querierv1.ProfileTypesResponse{
+		ProfileTypes: uniqueSortedProfileTypes(responses),
+	}), nil
 }
 
 func (q *Querier) LabelValues(ctx context.Context, req *connect.Request[typesv1.LabelValuesRequest]) (*connect.Response[typesv1.LabelValuesResponse], error) {
 	sp, ctx := opentracing.StartSpanFromContext(ctx, "LabelValues")
-	defer func() {
-		sp.LogFields(
-			otlog.String("name", req.Msg.Name),
-		)
-		sp.Finish()
-	}()
-	responses, err := forAllIngesters(ctx, q.ingesterQuerier, func(childCtx context.Context, ic IngesterQueryClient) ([]string, error) {
-		res, err := ic.LabelValues(childCtx, connect.NewRequest(&typesv1.LabelValuesRequest{
-			Name:     req.Msg.Name,
-			Matchers: req.Msg.Matchers,
-		}))
+	defer sp.Finish()
+
+	_, hasTimeRange := phlaremodel.GetTimeRange(req.Msg)
+	sp.LogFields(
+		otlog.Bool("legacy_request", !hasTimeRange),
+		otlog.String("name", req.Msg.Name),
+		otlog.String("matchers", strings.Join(req.Msg.Matchers, ",")),
+		otlog.Int64("start", req.Msg.Start),
+		otlog.Int64("end", req.Msg.End),
+	)
+
+	if q.storeGatewayQuerier == nil || !hasTimeRange {
+		responses, err := q.labelValuesFromIngesters(ctx, req.Msg)
 		if err != nil {
 			return nil, err
 		}
-		return res.Msg.Names, nil
-	})
+		return connect.NewResponse(&typesv1.LabelValuesResponse{
+			Names: uniqueSortedStrings(responses),
+		}), nil
+	}
+
+	storeQueries := splitQueryToStores(model.Time(req.Msg.Start), model.Time(req.Msg.End), model.Now(), q.cfg.QueryStoreAfter, nil)
+	if !storeQueries.ingester.shouldQuery && !storeQueries.storeGateway.shouldQuery {
+		return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("start and end time are outside of the ingester and store gateway retention"))
+	}
+	storeQueries.Log(level.Debug(spanlogger.FromContext(ctx, q.logger)))
+
+	var responses []ResponseFromReplica[[]string]
+	var lock sync.Mutex
+	group, ctx := errgroup.WithContext(ctx)
+
+	if storeQueries.ingester.shouldQuery {
+		group.Go(func() error {
+			ir, err := q.labelValuesFromIngesters(ctx, req.Msg)
+			if err != nil {
+				return err
+			}
+
+			lock.Lock()
+			responses = append(responses, ir...)
+			lock.Unlock()
+			return nil
+		})
+	}
+
+	if storeQueries.storeGateway.shouldQuery {
+		group.Go(func() error {
+			ir, err := q.labelValuesFromStoreGateway(ctx, req.Msg)
+			if err != nil {
+				return err
+			}
+
+			lock.Lock()
+			responses = append(responses, ir...)
+			lock.Unlock()
+			return nil
+		})
+	}
+
+	err := group.Wait()
 	if err != nil {
 		return nil, err
 	}
@@ -175,15 +272,64 @@ func (q *Querier) LabelValues(ctx context.Context, req *connect.Request[typesv1.
 func (q *Querier) LabelNames(ctx context.Context, req *connect.Request[typesv1.LabelNamesRequest]) (*connect.Response[typesv1.LabelNamesResponse], error) {
 	sp, ctx := opentracing.StartSpanFromContext(ctx, "LabelNames")
 	defer sp.Finish()
-	responses, err := forAllIngesters(ctx, q.ingesterQuerier, func(childCtx context.Context, ic IngesterQueryClient) ([]string, error) {
-		res, err := ic.LabelNames(childCtx, connect.NewRequest(&typesv1.LabelNamesRequest{
-			Matchers: req.Msg.Matchers,
-		}))
+
+	_, hasTimeRange := phlaremodel.GetTimeRange(req.Msg)
+	sp.LogFields(
+		otlog.Bool("legacy_request", !hasTimeRange),
+		otlog.String("matchers", strings.Join(req.Msg.Matchers, ",")),
+		otlog.Int64("start", req.Msg.Start),
+		otlog.Int64("end", req.Msg.End),
+	)
+
+	if q.storeGatewayQuerier == nil || !hasTimeRange {
+		responses, err := q.labelNamesFromIngesters(ctx, req.Msg)
 		if err != nil {
 			return nil, err
 		}
-		return res.Msg.Names, nil
-	})
+		return connect.NewResponse(&typesv1.LabelNamesResponse{
+			Names: uniqueSortedStrings(responses),
+		}), nil
+	}
+
+	storeQueries := splitQueryToStores(model.Time(req.Msg.Start), model.Time(req.Msg.End), model.Now(), q.cfg.QueryStoreAfter, nil)
+	if !storeQueries.ingester.shouldQuery && !storeQueries.storeGateway.shouldQuery {
+		return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("start and end time are outside of the ingester and store gateway retention"))
+	}
+	storeQueries.Log(level.Debug(spanlogger.FromContext(ctx, q.logger)))
+
+	var responses []ResponseFromReplica[[]string]
+	var lock sync.Mutex
+	group, ctx := errgroup.WithContext(ctx)
+
+	if storeQueries.ingester.shouldQuery {
+		group.Go(func() error {
+			ir, err := q.labelNamesFromIngesters(ctx, req.Msg)
+			if err != nil {
+				return err
+			}
+
+			lock.Lock()
+			responses = append(responses, ir...)
+			lock.Unlock()
+			return nil
+		})
+	}
+
+	if storeQueries.storeGateway.shouldQuery {
+		group.Go(func() error {
+			ir, err := q.labelNamesFromStoreGateway(ctx, req.Msg)
+			if err != nil {
+				return err
+			}
+
+			lock.Lock()
+			responses = append(responses, ir...)
+			lock.Unlock()
+			return nil
+		})
+	}
+
+	err := group.Wait()
 	if err != nil {
 		return nil, err
 	}
@@ -193,53 +339,117 @@ func (q *Querier) LabelNames(ctx context.Context, req *connect.Request[typesv1.L
 	}), nil
 }
 
-func filterSeriesByLabelNames(labelSets []*typesv1.Labels, labelNameMap map[string]struct{}) {
-	if len(labelNameMap) == 0 {
-		return
+func (q *Querier) blockSelect(ctx context.Context, start, end model.Time) (blockPlan, error) {
+	sp, ctx := opentracing.StartSpanFromContext(ctx, "blockSelect")
+	defer sp.Finish()
+
+	sp.LogFields(
+		otlog.String("start", start.Time().String()),
+		otlog.String("end", end.Time().String()),
+	)
+
+	ingesterReq := &ingestv1.BlockMetadataRequest{
+		Start: int64(start),
+		End:   int64(end),
 	}
 
-	for _, ls := range labelSets {
-		labelCount := 0
-		for idx := range ls.Labels {
-			_, ok := labelNameMap[ls.Labels[idx].Name]
-			if ok {
-				ls.Labels[labelCount] = ls.Labels[idx]
-				labelCount++
-			}
+	results := newReplicasPerBlockID(q.logger)
+
+	// get first all blocks from store gateways, as they should be querier with a priority and also aret the only ones containing duplicated blocks because of replication
+	if q.storeGatewayQuerier != nil {
+		res, err := q.blockSelectFromStoreGateway(ctx, ingesterReq)
+		if err != nil {
+			return nil, err
 		}
-		ls.Labels = ls.Labels[:labelCount]
+
+		results.add(res, storeGatewayInstance)
 	}
+
+	if q.ingesterQuerier != nil {
+		res, err := q.blockSelectFromIngesters(ctx, ingesterReq)
+		if err != nil {
+			return nil, err
+		}
+		results.add(res, ingesterInstance)
+	}
+
+	return results.blockPlan(ctx), nil
 }
 
 func (q *Querier) Series(ctx context.Context, req *connect.Request[querierv1.SeriesRequest]) (*connect.Response[querierv1.SeriesResponse], error) {
 	sp, ctx := opentracing.StartSpanFromContext(ctx, "Series")
-	defer func() {
-		sp.LogFields(
-			otlog.String("matchers", strings.Join(req.Msg.Matchers, ",")),
-			otlog.String("label_names", strings.Join(req.Msg.LabelNames, ",")),
-		)
-		sp.Finish()
-	}()
+	defer sp.Finish()
 
-	// build up map of label names
-	labelNameMap := make(map[string]struct{}, len(req.Msg.LabelNames))
-	for _, labelName := range req.Msg.LabelNames {
-		labelNameMap[labelName] = struct{}{}
-	}
-
-	responses, err := forAllIngesters(ctx, q.ingesterQuerier, func(childCtx context.Context, ic IngesterQueryClient) ([]*typesv1.Labels, error) {
-		res, err := ic.Series(childCtx, connect.NewRequest(&ingestv1.SeriesRequest{
+	_, hasTimeRange := phlaremodel.GetTimeRange(req.Msg)
+	sp.LogFields(
+		otlog.Bool("legacy_request", !hasTimeRange),
+		otlog.String("matchers", strings.Join(req.Msg.Matchers, ",")),
+		otlog.String("label_names", strings.Join(req.Msg.LabelNames, ",")),
+		otlog.Int64("start", req.Msg.Start),
+		otlog.Int64("end", req.Msg.End),
+	)
+	// no store gateways configured so just query the ingesters
+	if q.storeGatewayQuerier == nil || !hasTimeRange {
+		responses, err := q.seriesFromIngesters(ctx, &ingestv1.SeriesRequest{
 			Matchers:   req.Msg.Matchers,
 			LabelNames: req.Msg.LabelNames,
-		}))
+			Start:      req.Msg.Start,
+			End:        req.Msg.End,
+		})
 		if err != nil {
 			return nil, err
 		}
-		// TODO: Remove this once we have the ingesters returning the filtered response, has been rolled out (f25).
-		filterSeriesByLabelNames(res.Msg.LabelsSet, labelNameMap)
 
-		return res.Msg.LabelsSet, nil
-	})
+		return connect.NewResponse(&querierv1.SeriesResponse{
+			LabelsSet: lo.UniqBy(
+				lo.FlatMap(responses, func(r ResponseFromReplica[[]*typesv1.Labels], _ int) []*typesv1.Labels {
+					return r.response
+				}),
+				func(t *typesv1.Labels) uint64 {
+					return phlaremodel.Labels(t.Labels).Hash()
+				}),
+		}), nil
+	}
+
+	storeQueries := splitQueryToStores(model.Time(req.Msg.Start), model.Time(req.Msg.End), model.Now(), q.cfg.QueryStoreAfter, nil)
+	if !storeQueries.ingester.shouldQuery && !storeQueries.storeGateway.shouldQuery {
+		return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("start and end time are outside of the ingester and store gateway retention"))
+	}
+	storeQueries.Log(level.Debug(spanlogger.FromContext(ctx, q.logger)))
+
+	var responses []ResponseFromReplica[[]*typesv1.Labels]
+	var lock sync.Mutex
+	group, ctx := errgroup.WithContext(ctx)
+
+	if storeQueries.ingester.shouldQuery {
+		group.Go(func() error {
+			ir, err := q.seriesFromIngesters(ctx, storeQueries.ingester.SeriesRequest(req.Msg))
+			if err != nil {
+				return err
+			}
+
+			lock.Lock()
+			responses = append(responses, ir...)
+			lock.Unlock()
+			return nil
+		})
+	}
+
+	if storeQueries.storeGateway.shouldQuery {
+		group.Go(func() error {
+			ir, err := q.seriesFromStoreGateway(ctx, storeQueries.storeGateway.SeriesRequest(req.Msg))
+			if err != nil {
+				return err
+			}
+
+			lock.Lock()
+			responses = append(responses, ir...)
+			lock.Unlock()
+			return nil
+		})
+	}
+
+	err := group.Wait()
 	if err != nil {
 		return nil, err
 	}
@@ -251,10 +461,12 @@ func (q *Querier) Series(ctx context.Context, req *connect.Request[querierv1.Ser
 			}),
 			func(t *typesv1.Labels) uint64 {
 				return phlaremodel.Labels(t.Labels).Hash()
-			}),
+			},
+		),
 	}), nil
 }
 
+// FIXME(kolesnikovae): The method is never used and should be removed.
 func (q *Querier) Diff(ctx context.Context, req *connect.Request[querierv1.DiffRequest]) (*connect.Response[querierv1.DiffResponse], error) {
 	sp, ctx := opentracing.StartSpanFromContext(ctx, "Diff")
 	defer func() {
@@ -294,7 +506,7 @@ func (q *Querier) Diff(ctx context.Context, req *connect.Request[querierv1.DiffR
 		return nil, err
 	}
 
-	fd, err := phlaremodel.NewFlamegraphDiff(leftTree, rightTree, phlaremodel.MaxNodes)
+	fd, err := phlaremodel.NewFlamegraphDiff(leftTree, rightTree, maxNodesDefault)
 	if err != nil {
 		return nil, connect.NewError(connect.CodeInvalidArgument, err)
 	}
@@ -331,31 +543,83 @@ func (q *Querier) SelectMergeStacktraces(ctx context.Context, req *connect.Reque
 	}), nil
 }
 
-func (q *Querier) selectTree(ctx context.Context, req *querierv1.SelectMergeStacktracesRequest) (*phlaremodel.Tree, error) {
-	// no store gateways configured so just query the ingesters
-	if q.storeGatewayQuerier == nil {
-		return q.selectTreeFromIngesters(ctx, req)
+func (q *Querier) SelectMergeSpanProfile(ctx context.Context, req *connect.Request[querierv1.SelectMergeSpanProfileRequest]) (*connect.Response[querierv1.SelectMergeSpanProfileResponse], error) {
+	sp, ctx := opentracing.StartSpanFromContext(ctx, "SelectMergeSpanProfile")
+	level.Info(spanlogger.FromContext(ctx, q.logger)).Log(
+		"start", model.Time(req.Msg.Start).Time().String(),
+		"end", model.Time(req.Msg.End).Time().String(),
+		"selector", req.Msg.LabelSelector,
+		"profile_id", req.Msg.ProfileTypeID,
+	)
+	defer func() {
+		sp.Finish()
+	}()
+
+	if req.Msg.MaxNodes == nil || *req.Msg.MaxNodes == 0 {
+		mn := maxNodesDefault
+		req.Msg.MaxNodes = &mn
 	}
 
-	storeQueries := splitQueryToStores(model.Time(req.Start), model.Time(req.End), model.Now(), q.cfg.QueryStoreAfter)
+	t, err := q.selectSpanProfile(ctx, req.Msg)
+	if err != nil {
+		return nil, err
+	}
+
+	return connect.NewResponse(&querierv1.SelectMergeSpanProfileResponse{
+		Flamegraph: phlaremodel.NewFlameGraph(t, req.Msg.GetMaxNodes()),
+	}), nil
+}
+
+func isEndpointNotExistingErr(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	var cerr *connect.Error
+	// unwrap all intermediate connect errors
+	for errors.As(err, &cerr) {
+		err = cerr.Unwrap()
+	}
+	return err.Error() == "405 Method Not Allowed"
+}
+
+func (q *Querier) selectTree(ctx context.Context, req *querierv1.SelectMergeStacktracesRequest) (*phlaremodel.Tree, error) {
+	// determine the block hints
+	plan, err := q.blockSelect(ctx, model.Time(req.Start), model.Time(req.End))
+	if isEndpointNotExistingErr(err) {
+		level.Warn(spanlogger.FromContext(ctx, q.logger)).Log(
+			"msg", "block select not supported on at least one component, fallback to use full dataset",
+			"err", err,
+		)
+		plan = nil
+	} else if err != nil {
+		return nil, fmt.Errorf("error during block select: %w", err)
+	}
+
+	// no store gateways configured so just query the ingesters
+	if q.storeGatewayQuerier == nil {
+		return q.selectTreeFromIngesters(ctx, req, plan)
+	}
+
+	storeQueries := splitQueryToStores(model.Time(req.Start), model.Time(req.End), model.Now(), q.cfg.QueryStoreAfter, plan)
 	if !storeQueries.ingester.shouldQuery && !storeQueries.storeGateway.shouldQuery {
 		return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("start and end time are outside of the ingester and store gateway retention"))
 	}
 
 	storeQueries.Log(level.Debug(spanlogger.FromContext(ctx, q.logger)))
 
-	if !storeQueries.ingester.shouldQuery {
-		return q.selectTreeFromStoreGateway(ctx, storeQueries.storeGateway.MergeStacktracesRequest(req))
+	if plan == nil && !storeQueries.ingester.shouldQuery {
+		return q.selectTreeFromStoreGateway(ctx, storeQueries.storeGateway.MergeStacktracesRequest(req), plan)
 	}
-	if !storeQueries.storeGateway.shouldQuery {
-		return q.selectTreeFromIngesters(ctx, storeQueries.ingester.MergeStacktracesRequest(req))
+	if plan == nil && !storeQueries.storeGateway.shouldQuery {
+		return q.selectTreeFromIngesters(ctx, storeQueries.ingester.MergeStacktracesRequest(req), plan)
 	}
 
 	g, ctx := errgroup.WithContext(ctx)
 	var ingesterTree, storegatewayTree *phlaremodel.Tree
 	g.Go(func() error {
 		var err error
-		ingesterTree, err = q.selectTreeFromIngesters(ctx, storeQueries.ingester.MergeStacktracesRequest(req))
+		ingesterTree, err = q.selectTreeFromIngesters(ctx, storeQueries.ingester.MergeStacktracesRequest(req), plan)
 		if err != nil {
 			return err
 		}
@@ -363,7 +627,7 @@ func (q *Querier) selectTree(ctx context.Context, req *querierv1.SelectMergeStac
 	})
 	g.Go(func() error {
 		var err error
-		storegatewayTree, err = q.selectTreeFromStoreGateway(ctx, storeQueries.storeGateway.MergeStacktracesRequest(req))
+		storegatewayTree, err = q.selectTreeFromStoreGateway(ctx, storeQueries.storeGateway.MergeStacktracesRequest(req), plan)
 		if err != nil {
 			return err
 		}
@@ -403,6 +667,35 @@ func (sq storeQuery) MergeSeriesRequest(req *querierv1.SelectSeriesRequest, prof
 	}
 }
 
+func (sq storeQuery) MergeSpanProfileRequest(req *querierv1.SelectMergeSpanProfileRequest) *querierv1.SelectMergeSpanProfileRequest {
+	return &querierv1.SelectMergeSpanProfileRequest{
+		Start:         int64(sq.start),
+		End:           int64(sq.end),
+		ProfileTypeID: req.ProfileTypeID,
+		LabelSelector: req.LabelSelector,
+		SpanSelector:  req.SpanSelector,
+		MaxNodes:      req.MaxNodes,
+	}
+}
+
+func (sq storeQuery) MergeProfileRequest(req *querierv1.SelectMergeProfileRequest) *querierv1.SelectMergeProfileRequest {
+	return &querierv1.SelectMergeProfileRequest{
+		ProfileTypeID: req.ProfileTypeID,
+		LabelSelector: req.LabelSelector,
+		Start:         int64(sq.start),
+		End:           int64(sq.end),
+	}
+}
+
+func (sq storeQuery) SeriesRequest(req *querierv1.SeriesRequest) *ingestv1.SeriesRequest {
+	return &ingestv1.SeriesRequest{
+		Start:      int64(sq.start),
+		End:        int64(sq.end),
+		Matchers:   req.Matchers,
+		LabelNames: req.LabelNames,
+	}
+}
+
 type storeQueries struct {
 	ingester, storeGateway storeQuery
 	queryStoreAfter        time.Duration
@@ -421,7 +714,15 @@ func (sq storeQueries) Log(logger log.Logger) {
 
 // splitQueryToStores splits the query into ingester and store gateway queries using the given cut off time.
 // todo(ctovena): Later we should try to deduplicate blocks between ingesters and store gateways (prefer) and simply query both
-func splitQueryToStores(start, end model.Time, now model.Time, queryStoreAfter time.Duration) (queries storeQueries) {
+func splitQueryToStores(start, end model.Time, now model.Time, queryStoreAfter time.Duration, plan blockPlan) (queries storeQueries) {
+	if plan != nil {
+		// if we have a plan we can use it to split the query, we retain the original start and end time as we want to query the full range for those particular blocks selected.
+		queries.queryStoreAfter = 0
+		queries.ingester = storeQuery{shouldQuery: true, start: start, end: end}
+		queries.storeGateway = storeQuery{shouldQuery: true, start: start, end: end}
+		return queries
+	}
+
 	queries.queryStoreAfter = queryStoreAfter
 	cutOff := now.Add(-queryStoreAfter)
 	if start.Before(cutOff) {
@@ -449,50 +750,75 @@ func (q *Querier) SelectMergeProfile(ctx context.Context, req *connect.Request[q
 		sp.Finish()
 	}()
 
-	profileType, err := phlaremodel.ParseProfileTypeSelector(req.Msg.ProfileTypeID)
-	if err != nil {
-		return nil, connect.NewError(connect.CodeInvalidArgument, err)
-	}
-	_, err = parser.ParseMetricSelector(req.Msg.LabelSelector)
-	if err != nil {
-		return nil, connect.NewError(connect.CodeInvalidArgument, err)
-	}
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	responses, err := forAllIngesters(ctx, q.ingesterQuerier, func(ctx context.Context, ic IngesterQueryClient) (clientpool.BidiClientMergeProfilesPprof, error) {
-		return ic.MergeProfilesPprof(ctx), nil
-	})
-	if err != nil {
-		return nil, connect.NewError(connect.CodeInternal, err)
-	}
-	// send the first initial request to all ingesters.
-	g, gCtx := errgroup.WithContext(ctx)
-	for _, r := range responses {
-		r := r
-		g.Go(util.RecoverPanic(func() error {
-			return r.response.Send(&ingestv1.MergeProfilesPprofRequest{
-				Request: &ingestv1.SelectProfilesRequest{
-					LabelSelector: req.Msg.LabelSelector,
-					Start:         req.Msg.Start,
-					End:           req.Msg.End,
-					Type:          profileType,
-				},
-			})
-		}))
-	}
-	if err := g.Wait(); err != nil {
-		return nil, connect.NewError(connect.CodeInternal, err)
-	}
-
-	// merge all profiles
-	profile, err := selectMergePprofProfile(gCtx, profileType, responses)
+	profile, err := q.selectProfile(ctx, req.Msg)
 	if err != nil {
 		return nil, err
 	}
 	profile.DurationNanos = model.Time(req.Msg.End).UnixNano() - model.Time(req.Msg.Start).UnixNano()
 	profile.TimeNanos = model.Time(req.Msg.End).UnixNano()
 	return connect.NewResponse(profile), nil
+}
+
+func (q *Querier) selectProfile(ctx context.Context, req *querierv1.SelectMergeProfileRequest) (*googlev1.Profile, error) {
+	// determine the block hints
+	plan, err := q.blockSelect(ctx, model.Time(req.Start), model.Time(req.End))
+	if isEndpointNotExistingErr(err) {
+		level.Warn(spanlogger.FromContext(ctx, q.logger)).Log(
+			"msg", "block select not supported on at least one component, fallback to use full dataset",
+			"err", err,
+		)
+		plan = nil
+	} else if err != nil {
+		return nil, fmt.Errorf("error during block select: %w", err)
+	}
+
+	// no store gateways configured so just query the ingesters
+	if q.storeGatewayQuerier == nil {
+		return q.selectProfileFromIngesters(ctx, req, plan)
+	}
+
+	storeQueries := splitQueryToStores(model.Time(req.Start), model.Time(req.End), model.Now(), q.cfg.QueryStoreAfter, plan)
+	if !storeQueries.ingester.shouldQuery && !storeQueries.storeGateway.shouldQuery {
+		return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("start and end time are outside of the ingester and store gateway retention"))
+	}
+
+	storeQueries.Log(level.Debug(spanlogger.FromContext(ctx, q.logger)))
+
+	if plan == nil && !storeQueries.ingester.shouldQuery {
+		return q.selectProfileFromStoreGateway(ctx, storeQueries.storeGateway.MergeProfileRequest(req), plan)
+	}
+	if plan == nil && !storeQueries.storeGateway.shouldQuery {
+		return q.selectProfileFromIngesters(ctx, storeQueries.ingester.MergeProfileRequest(req), plan)
+	}
+
+	g, ctx := errgroup.WithContext(ctx)
+	var lock sync.Mutex
+	var merge pprof.ProfileMerge
+	g.Go(func() error {
+		ingesterProfile, err := q.selectProfileFromIngesters(ctx, storeQueries.ingester.MergeProfileRequest(req), plan)
+		if err != nil {
+			return err
+		}
+		lock.Lock()
+		err = merge.Merge(ingesterProfile)
+		lock.Unlock()
+		return err
+	})
+	g.Go(func() error {
+		storegatewayProfile, err := q.selectProfileFromStoreGateway(ctx, storeQueries.storeGateway.MergeProfileRequest(req), plan)
+		if err != nil {
+			return err
+		}
+		lock.Lock()
+		err = merge.Merge(storegatewayProfile)
+		lock.Unlock()
+		return err
+	})
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+
+	return merge.Profile(), nil
 }
 
 func (q *Querier) SelectSeries(ctx context.Context, req *connect.Request[querierv1.SelectSeriesRequest]) (*connect.Response[querierv1.SelectSeriesResponse], error) {
@@ -526,7 +852,19 @@ func (q *Querier) SelectSeries(ctx context.Context, req *connect.Request[querier
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	responses, err := q.selectSeries(ctx, req)
+	// determine the block hints
+	plan, err := q.blockSelect(ctx, model.Time(req.Msg.Start), model.Time(req.Msg.End))
+	if isEndpointNotExistingErr(err) {
+		level.Warn(spanlogger.FromContext(ctx, q.logger)).Log(
+			"msg", "block select not supported on at least one component, fallback to use full dataset",
+			"err", err,
+		)
+		plan = nil
+	} else if err != nil {
+		return nil, fmt.Errorf("error during block select: %w", err)
+	}
+
+	responses, err := q.selectSeries(ctx, req, plan)
 	if err != nil {
 		return nil, err
 	}
@@ -546,7 +884,7 @@ func (q *Querier) SelectSeries(ctx context.Context, req *connect.Request[querier
 	}), nil
 }
 
-func (q *Querier) selectSeries(ctx context.Context, req *connect.Request[querierv1.SelectSeriesRequest]) ([]ResponseFromReplica[clientpool.BidiClientMergeProfilesLabels], error) {
+func (q *Querier) selectSeries(ctx context.Context, req *connect.Request[querierv1.SelectSeriesRequest], plan map[string]*ingestv1.BlockHints) ([]ResponseFromReplica[clientpool.BidiClientMergeProfilesLabels], error) {
 	stepMs := time.Duration(req.Msg.Step * float64(time.Second)).Milliseconds()
 	sort.Strings(req.Msg.GroupBy)
 
@@ -568,10 +906,10 @@ func (q *Querier) selectSeries(ctx context.Context, req *connect.Request[querier
 				Type:          profileType,
 			},
 			By: req.Msg.GroupBy,
-		})
+		}, plan)
 	}
 
-	storeQueries := splitQueryToStores(model.Time(start), model.Time(req.Msg.End), model.Now(), q.cfg.QueryStoreAfter)
+	storeQueries := splitQueryToStores(model.Time(start), model.Time(req.Msg.End), model.Now(), q.cfg.QueryStoreAfter, plan)
 
 	var responses []ResponseFromReplica[clientpool.BidiClientMergeProfilesLabels]
 
@@ -581,7 +919,7 @@ func (q *Querier) selectSeries(ctx context.Context, req *connect.Request[querier
 
 	// todo in parallel
 	if storeQueries.ingester.shouldQuery {
-		ir, err := q.selectSeriesFromIngesters(ctx, storeQueries.ingester.MergeSeriesRequest(req.Msg, profileType))
+		ir, err := q.selectSeriesFromIngesters(ctx, storeQueries.ingester.MergeSeriesRequest(req.Msg, profileType), plan)
 		if err != nil {
 			return nil, err
 		}
@@ -589,7 +927,7 @@ func (q *Querier) selectSeries(ctx context.Context, req *connect.Request[querier
 	}
 
 	if storeQueries.storeGateway.shouldQuery {
-		ir, err := q.selectSeriesFromStoreGateway(ctx, storeQueries.storeGateway.MergeSeriesRequest(req.Msg, profileType))
+		ir, err := q.selectSeriesFromStoreGateway(ctx, storeQueries.storeGateway.MergeSeriesRequest(req.Msg, profileType), plan)
 		if err != nil {
 			return nil, err
 		}
@@ -671,4 +1009,70 @@ func uniqueSortedStrings(responses []ResponseFromReplica[[]string]) []string {
 	}
 	sort.Strings(result)
 	return result
+}
+
+func uniqueSortedProfileTypes(responses []ResponseFromReplica[*ingestv1.ProfileTypesResponse]) []*typesv1.ProfileType {
+	var ids []string
+	types := make(map[string]*typesv1.ProfileType)
+	for _, replica := range responses {
+		for _, typ := range replica.response.ProfileTypes {
+			_, ok := types[typ.ID]
+			if !ok {
+				ids = append(ids, typ.ID)
+				types[typ.ID] = typ
+			}
+		}
+	}
+
+	slices.Sort(ids)
+	profileTypes := make([]*typesv1.ProfileType, len(types))
+	for i, id := range ids {
+		profileTypes[i] = types[id]
+	}
+	return profileTypes
+}
+
+func (q *Querier) selectSpanProfile(ctx context.Context, req *querierv1.SelectMergeSpanProfileRequest) (*phlaremodel.Tree, error) {
+	// no store gateways configured so just query the ingesters
+	if q.storeGatewayQuerier == nil {
+		return q.selectSpanProfileFromIngesters(ctx, req)
+	}
+
+	storeQueries := splitQueryToStores(model.Time(req.Start), model.Time(req.End), model.Now(), q.cfg.QueryStoreAfter, nil)
+	if !storeQueries.ingester.shouldQuery && !storeQueries.storeGateway.shouldQuery {
+		return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("start and end time are outside of the ingester and store gateway retention"))
+	}
+
+	storeQueries.Log(level.Debug(spanlogger.FromContext(ctx, q.logger)))
+
+	if !storeQueries.ingester.shouldQuery {
+		return q.selectSpanProfileFromStoreGateway(ctx, storeQueries.storeGateway.MergeSpanProfileRequest(req))
+	}
+	if !storeQueries.storeGateway.shouldQuery {
+		return q.selectSpanProfileFromIngesters(ctx, storeQueries.ingester.MergeSpanProfileRequest(req))
+	}
+
+	g, ctx := errgroup.WithContext(ctx)
+	var ingesterTree, storegatewayTree *phlaremodel.Tree
+	g.Go(func() error {
+		var err error
+		ingesterTree, err = q.selectSpanProfileFromIngesters(ctx, storeQueries.ingester.MergeSpanProfileRequest(req))
+		if err != nil {
+			return err
+		}
+		return nil
+	})
+	g.Go(func() error {
+		var err error
+		storegatewayTree, err = q.selectSpanProfileFromStoreGateway(ctx, storeQueries.storeGateway.MergeSpanProfileRequest(req))
+		if err != nil {
+			return err
+		}
+		return nil
+	})
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+	storegatewayTree.Merge(ingesterTree)
+	return storegatewayTree, nil
 }

@@ -14,12 +14,12 @@ aliases:
 1. Obtain `Pyroscope.Profiler.Native.so` and `Pyroscope.Linux.ApiWrapper.x64.so` from the [latest tarball](https://github.com/pyroscope-io/pyroscope-dotnet/releases/):
 
 ```bash
-curl -s -L https://github.com/grafana/pyroscope-dotnet/releases/download/v0.8.8-pyroscope/pyroscope.0.8.8-glibc-x86_64.tar.gz  | tar xvz -C .
+curl -s -L https://github.com/grafana/pyroscope-dotnet/releases/download/v0.8.14-pyroscope/pyroscope.0.8.14-glibc-x86_64.tar.gz  | tar xvz -C .
 ```
 Or copy them from the [latest docker image](https://hub.docker.com/r/pyroscope/pyroscope-dotnet/tags):
 ```dockerfile
-COPY --from=pyroscope/pyroscope-dotnet:0.8.8-glibc /Pyroscope.Profiler.Native.so ./Pyroscope.Profiler.Native.so
-COPY --from=pyroscope/pyroscope-dotnet:0.8.8-glibc /Pyroscope.Linux.ApiWrapper.x64.so ./Pyroscope.Linux.ApiWrapper.x64.so
+COPY --from=pyroscope/pyroscope-dotnet:0.8.14-glibc /Pyroscope.Profiler.Native.so ./Pyroscope.Profiler.Native.so
+COPY --from=pyroscope/pyroscope-dotnet:0.8.14-glibc /Pyroscope.Linux.ApiWrapper.x64.so ./Pyroscope.Linux.ApiWrapper.x64.so
 ````
 
 2. Set the following required environment variables to enable profiler
@@ -93,7 +93,7 @@ Pyroscope.Profiler.Instance.SetCPUTrackingEnabled(enabled);
 // If allocation profiling is not configured, this function will have no effect.
 Pyroscope.Profiler.Instance.SetAllocationTrackingEnabled(enabled);
 // Enables or disables contention profiling dynamically.
-// This function works in conjunction with the PYROSCOPE_PROFILING_CONTENTION_ENABLED environment variable.
+// This function works in conjunction with the PYROSCOPE_PROFILING_LOCK_ENABLED environment variable.
 // If contention profiling is not configured, this function will have no effect.
 Pyroscope.Profiler.Instance.SetContentionTrackingEnabled(enabled);
 // Enables or disables exception profiling dynamically.
@@ -113,20 +113,20 @@ Here is a simple [example](https://github.com/grafana/pyroscope/blob/main/exampl
 
 ## Configuration
 
-| ENVIRONMENT VARIABLE                   | Type         | DESCRIPTION |
-|----------------------------------------|--------------|-------------|
-| PYROSCOPE_PROFILING_LOG_DIR            | String       | Sets the directory for .NET Profiler logs. Defaults to /var/log/pyroscope/. |
+| ENVIRONMENT VARIABLE                   | Type         | DESCRIPTION                                                                                                                       |
+|----------------------------------------|--------------|-----------------------------------------------------------------------------------------------------------------------------------|
+| PYROSCOPE_PROFILING_LOG_DIR            | String       | Sets the directory for .NET Profiler logs. Defaults to /var/log/pyroscope/.                                                       |
 | PYROSCOPE_LABELS                       | String       | Static labels to apply to an uploaded profile. Must be a list of key:value separated by commas such as: layer:api or team:intake. |
-| PYROSCOPE_SERVER_ADDRESS               | String       | Address of the Pyroscope Server |
-| PYROSCOPE_PROFILING_ENABLED            | Boolean      | If set to true, enables the .NET Profiler. Defaults to false. |
-| PYROSCOPE_PROFILING_WALLTIME_ENABLED   | Boolean      | If set to false, disables the Wall time profiling. Defaults to true. |
-| PYROSCOPE_PROFILING_CPU_ENABLED        | Boolean      | If set to false, disables the CPU profiling. Defaults to true. |
-| PYROSCOPE_PROFILING_EXCEPTION_ENABLED  | Boolean      | If set to true, enables the Exceptions profiling. Defaults to false. |
-| PYROSCOPE_PROFILING_ALLOCATION_ENABLED | Boolean      | If set to true, enables the Allocations profiling. Defaults to false. |
-| PYROSCOPE_PROFILING_LOCK_ENABLED       | Boolean      | If set to true, enables the Lock Contention profiling. Defaults to false. |
-| PYROSCOPE_BASIC_AUTH_USER              | String       | For HTTP Basic Authentication, use this to send profiles to authenticated server, for example Grafana Cloud |
-| PYROSCOPE_BASIC_AUTH_PASSWORD          | String       | For HTTP Basic Authentication, use this to send profiles to authenticated server, for example Grafana Cloud |
-| PYROSCOPE_TENANT_ID                    | String       | Only needed if using multi-tenancy in Pyroscope. |
+| PYROSCOPE_SERVER_ADDRESS               | String       | Address of the Pyroscope Server                                                                                                   |
+| PYROSCOPE_PROFILING_ENABLED            | Boolean      | If set to true, enables the .NET Profiler. Defaults to false.                                                                     |
+| PYROSCOPE_PROFILING_WALLTIME_ENABLED   | Boolean      | If set to false, disables the Wall time profiling. Defaults to false.                                                             |
+| PYROSCOPE_PROFILING_CPU_ENABLED        | Boolean      | If set to false, disables the CPU profiling. Defaults to true.                                                                    |
+| PYROSCOPE_PROFILING_EXCEPTION_ENABLED  | Boolean      | If set to true, enables the Exceptions profiling. Defaults to false.                                                              |
+| PYROSCOPE_PROFILING_ALLOCATION_ENABLED | Boolean      | If set to true, enables the Allocations profiling. Defaults to false.                                                             |
+| PYROSCOPE_PROFILING_LOCK_ENABLED       | Boolean      | If set to true, enables the Lock Contention profiling. Defaults to false.                                                         |
+| PYROSCOPE_BASIC_AUTH_USER              | String       | For HTTP Basic Authentication, use this to send profiles to authenticated server, for example Grafana Cloud                       |
+| PYROSCOPE_BASIC_AUTH_PASSWORD          | String       | For HTTP Basic Authentication, use this to send profiles to authenticated server, for example Grafana Cloud                       |
+| PYROSCOPE_TENANT_ID                    | String       | Only needed if using multi-tenancy in Pyroscope.                                                                                  |
 
 ## Sending data to Pyroscope OSS or Grafana Cloud Profiles with .NET SDK
 

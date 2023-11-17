@@ -7,6 +7,7 @@ apiVersion: apps/v1
 kind: {{ $cfg.kind }}
 metadata:
   name: {{ $cfg.name }}
+  namespace: {{ .Release.Namespace }}
   labels:
     {{- include "pyroscope.labels" . | nindent 4 }}
     app.kubernetes.io/component: {{ $component | quote }}
@@ -41,6 +42,16 @@ spec:
       serviceAccountName: {{ include "pyroscope.serviceAccountName" . }}
       securityContext:
         {{- toYaml $values.podSecurityContext | nindent 8 }}
+      {{- if hasKey $values "hostNetwork" }}
+      hostNetwork: {{ $values.hostNetwork }}
+      {{- end }}
+      {{- if hasKey $values "dnsPolicy" }}
+      dnsPolicy: {{ $values.dnsPolicy }}
+      {{- end }}
+      {{- with $values.initContainers }}
+      initContainers:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       containers:
         - name: {{ if eq $component "all" }}"pyroscope"{{ else }}"{{ $component }}"{{ end }}
           securityContext:
@@ -84,6 +95,7 @@ spec:
             httpGet:
               path: /ready
               port: {{ $values.service.port_name }}
+              scheme: {{ $values.service.scheme }}
           volumeMounts:
             - name: config
               mountPath: /etc/pyroscope/config.yaml
@@ -92,6 +104,12 @@ spec:
               mountPath: /etc/pyroscope/overrides/
             - name: data
               mountPath: /data
+            {{- if eq $component "compactor" }}
+              subPath: default
+            - name: data
+              mountPath: /data-compactor
+              subPath: compactor
+            {{- end }}
             {{- with $values.extraVolumeMounts }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
@@ -152,17 +170,23 @@ spec:
         {{- toYaml $persistence.selector | nindent 8 }}
       {{- end }}
   {{- end }}
-{{- if eq $values.kind "StatefulSet" }}
 ---
+{{- $pdb := $values.podDisruptionBudget }}
+{{- if $pdb.enabled }}
 apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:
   name: {{ $cfg.name }}
+  namespace: {{ .Release.Namespace }}
   labels:
     {{- include "pyroscope.labels" . | nindent 4 }}
     app.kubernetes.io/component: {{ $component | quote }}
 spec:
-  maxUnavailable: 1
+  {{- if hasKey $pdb "minAvailable" }}
+  minAvailable: {{ $pdb.minAvailable }}
+  {{- else }}
+  maxUnavailable: {{ $pdb.maxUnavailable }}
+  {{- end }}
   selector:
     matchLabels:
       {{- include "pyroscope.selectorLabels" . | nindent 6 }}

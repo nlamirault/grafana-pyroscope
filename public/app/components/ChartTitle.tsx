@@ -15,19 +15,25 @@ const chartTitleKeys = {
   exceptions: 'Total number of exceptions thrown',
   unknown: '',
 
-  baseline: 'Baseline Flamegraph',
-  comparison: 'Comparison Flamegraph',
+  baseline: 'Baseline time range',
+  comparison: 'Comparison time range',
   selection_included: 'Selection-included Exemplar Flamegraph',
   selection_excluded: 'Selection-excluded Exemplar Flamegraph',
 };
 
-interface ChartTitleProps {
+type ChartTitleKey = keyof typeof chartTitleKeys;
+
+export interface ChartTitleProps {
   children?: ReactNode;
   className?: string;
   color?: Color;
   icon?: ReactNode;
   postfix?: ReactNode;
-  titleKey?: keyof typeof chartTitleKeys;
+  titleKey?: ChartTitleKey;
+}
+
+export function getChartTitle(key: ChartTitleKey) {
+  return chartTitleKeys[key];
 }
 
 export default function ChartTitle({
@@ -50,7 +56,7 @@ export default function ChartTitle({
           {icon}
         </span>
       )}
-      <p className={styles.title}>{children || chartTitleKeys[titleKey]}</p>
+      <p className={styles.title}>{children || getChartTitle(titleKey)}</p>
       {postfix}
     </div>
   );

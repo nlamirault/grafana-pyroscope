@@ -1,11 +1,11 @@
 package block
 
 import (
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"io"
 	"math"
-	"math/rand"
 	"os"
 	"path/filepath"
 	"time"
@@ -19,6 +19,8 @@ import (
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/tsdb"
 	"github.com/prometheus/prometheus/tsdb/fileutil"
+
+	typesv1 "github.com/grafana/pyroscope/api/gen/proto/go/types/v1"
 )
 
 const (
@@ -62,6 +64,16 @@ const (
 	MetaVersion3 = MetaVersion(3)
 )
 
+// IsValid returns true if the version is valid.
+func (v MetaVersion) IsValid() bool {
+	switch v {
+	case MetaVersion1, MetaVersion2, MetaVersion3:
+		return true
+	default:
+		return false
+	}
+}
+
 type BlockStats struct {
 	NumSamples  uint64 `json:"numSamples,omitempty"`
 	NumSeries   uint64 `json:"numSeries,omitempty"`
@@ -88,6 +100,31 @@ type TSDBFile struct {
 	NumSeries uint64 `json:"numSeries,omitempty"`
 }
 
+// BlockDesc describes a block by ULID and time range.
+type BlockDesc struct {
+	ULID    ulid.ULID  `json:"ulid"`
+	MinTime model.Time `json:"minTime"`
+	MaxTime model.Time `json:"maxTime"`
+}
+
+// BlockMetaCompaction holds information about compactions a block went through.
+type BlockMetaCompaction struct {
+	// Maximum number of compaction cycles any source block has
+	// gone through.
+	Level int `json:"level"`
+	// ULIDs of all source head blocks that went into the block.
+	Sources []ulid.ULID `json:"sources,omitempty"`
+	// Indicates that during compaction it resulted in a block without any samples
+	// so it should be deleted on the next reloadBlocks.
+	Deletable bool `json:"deletable,omitempty"`
+	// Short descriptions of the direct blocks that were used to create
+	// this block.
+	Parents []BlockDesc `json:"parents,omitempty"`
+	Failed  bool        `json:"failed,omitempty"`
+	// Additional information about the compaction, for example, block created from out-of-order chunks.
+	Hints []string `json:"hints,omitempty"`
+}
+
 type Meta struct {
 	// Unique identifier for the block and its contents. Changes on compaction.
 	ULID ulid.ULID `json:"ulid"`
@@ -105,16 +142,23 @@ type Meta struct {
 	Files []File `json:"files,omitempty"`
 
 	// Information on compactions the block was created from.
-	Compaction tsdb.BlockMetaCompaction `json:"compaction"`
+	Compaction BlockMetaCompaction `json:"compaction"`
 
 	// Version of the index format.
 	Version MetaVersion `json:"version"`
 
 	// Labels are the external labels identifying the producer as well as tenant.
-	Labels map[string]string `json:"labels,omitempty"`
+	Labels map[string]string `json:"labels"`
 
 	// Source is a real upload source of the block.
 	Source SourceType `json:"source,omitempty"`
+
+	// Downsample is a downsampling resolution of the block. 0 means no downsampling.
+	Downsample `json:"downsample"`
+}
+
+type Downsample struct {
+	Resolution int64 `json:"resolution"`
 }
 
 func (m *Meta) FileByRelPath(name string) *File {
@@ -134,8 +178,8 @@ func (m *Meta) String() string {
 	return fmt.Sprintf(
 		"%s (min time: %s, max time: %s)",
 		m.ULID,
-		m.MinTime.Time().Format(time.RFC3339Nano),
-		m.MaxTime.Time().Format(time.RFC3339Nano),
+		m.MinTime.Time().UTC().Format(time.RFC3339Nano),
+		m.MaxTime.Time().UTC().Format(time.RFC3339Nano),
 	)
 }
 
@@ -150,11 +194,39 @@ func (m *Meta) Clone() *Meta {
 	}
 	return &clone
 }
+func (m *Meta) BlockInfo() *typesv1.BlockInfo {
+	info := &typesv1.BlockInfo{}
+	m.WriteBlockInfo(info)
+	return info
+}
 
-var ulidEntropy = rand.New(rand.NewSource(time.Now().UnixNano()))
+func (m *Meta) WriteBlockInfo(info *typesv1.BlockInfo) {
+	info.Ulid = m.ULID.String()
+	info.MinTime = int64(m.MinTime)
+	info.MaxTime = int64(m.MaxTime)
+	if info.Compaction == nil {
+		info.Compaction = &typesv1.BlockCompaction{}
+	}
+	info.Compaction.Level = int32(m.Compaction.Level)
+	info.Compaction.Parents = make([]string, len(m.Compaction.Parents))
+	for i, p := range m.Compaction.Parents {
+		info.Compaction.Parents[i] = p.ULID.String()
+	}
+	info.Compaction.Sources = make([]string, len(m.Compaction.Sources))
+	for i, s := range m.Compaction.Sources {
+		info.Compaction.Sources[i] = s.String()
+	}
+	info.Labels = make([]*typesv1.LabelPair, 0, len(m.Labels))
+	for k, v := range m.Labels {
+		info.Labels = append(info.Labels, &typesv1.LabelPair{
+			Name:  k,
+			Value: v,
+		})
+	}
+}
 
 func generateULID() ulid.ULID {
-	return ulid.MustNew(ulid.Timestamp(time.Now()), ulidEntropy)
+	return ulid.MustNew(ulid.Timestamp(time.Now()), rand.Reader)
 }
 
 func NewMeta() *Meta {
@@ -212,6 +284,7 @@ func (meta *Meta) WriteTo(w io.Writer) (int64, error) {
 	return int64(wrapped.n), enc.Encode(meta)
 }
 
+// WriteToFile writes the encoded meta into <dir>/meta.json.
 func (meta *Meta) WriteToFile(logger log.Logger, dir string) (int64, error) {
 	// Make any changes to the file appear atomic.
 	path := filepath.Join(dir, MetaFilename)
@@ -255,8 +328,8 @@ func (meta *Meta) TSDBBlockMeta() tsdb.BlockMeta {
 	}
 }
 
-// ReadFromDir reads the given meta from <dir>/meta.json.
-func ReadFromDir(dir string) (*Meta, error) {
+// ReadMetaFromDir reads the given meta from <dir>/meta.json.
+func ReadMetaFromDir(dir string) (*Meta, error) {
 	f, err := os.Open(filepath.Join(dir, filepath.Clean(MetaFilename)))
 	if err != nil {
 		return nil, err

@@ -26,7 +26,9 @@ import (
 	"github.com/pkg/errors"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/promql/parser"
+	"github.com/prometheus/prometheus/storage"
 	"github.com/samber/lo"
+	"golang.org/x/exp/slices"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc/codes"
 
@@ -307,7 +309,7 @@ func NewSingleBlockQuerierFromMeta(phlarectx context.Context, bucketReader phlar
 	for _, f := range meta.Files {
 		switch f.RelPath {
 		case q.profiles.relPath():
-			q.profiles.size = int64(f.SizeBytes)
+			q.profiles.meta = f
 		}
 	}
 	q.tables = []tableReader{
@@ -316,8 +318,8 @@ func NewSingleBlockQuerierFromMeta(phlarectx context.Context, bucketReader phlar
 	return q
 }
 
-func (b *singleBlockQuerier) Profiles() []parquet.RowGroup {
-	return b.profiles.file.RowGroups()
+func (b *singleBlockQuerier) Profiles() parquet.Rows {
+	return parquet.NewReader(b.profiles.file.File, schemav1.ProfilesSchema)
 }
 
 func (b *singleBlockQuerier) Index() IndexReader {
@@ -333,6 +335,167 @@ func (b *singleBlockQuerier) Meta() block.Meta {
 		return block.Meta{}
 	}
 	return *b.meta
+}
+
+func (b *singleBlockQuerier) ProfileTypes(ctx context.Context, req *connect.Request[ingestv1.ProfileTypesRequest]) (*connect.Response[ingestv1.ProfileTypesResponse], error) {
+	sp, ctx := opentracing.StartSpanFromContext(ctx, "ProfileTypes Block")
+	defer sp.Finish()
+
+	err := b.Open(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	values, err := b.index.LabelValues(phlaremodel.LabelNameProfileType)
+	if err != nil {
+		return nil, err
+	}
+	slices.Sort(values)
+
+	types := make([]*typesv1.ProfileType, len(values))
+	for i, value := range values {
+		typ, err := phlaremodel.ParseProfileTypeSelector(value)
+		if err != nil {
+			return nil, err
+		}
+		types[i] = typ
+	}
+
+	return connect.NewResponse(&ingestv1.ProfileTypesResponse{
+		ProfileTypes: types,
+	}), nil
+}
+
+func (b *singleBlockQuerier) LabelValues(ctx context.Context, req *connect.Request[typesv1.LabelValuesRequest]) (*connect.Response[typesv1.LabelValuesResponse], error) {
+	sp, ctx := opentracing.StartSpanFromContext(ctx, "LabelValues Block")
+	defer sp.Finish()
+
+	params := req.Msg
+
+	err := b.Open(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	names, err := b.index.LabelNames()
+	if err != nil {
+		return nil, err
+	}
+	if !slices.Contains(names, req.Msg.Name) {
+		return connect.NewResponse(&typesv1.LabelValuesResponse{
+			Names: []string{},
+		}), nil
+	}
+
+	selectors, err := parseSelectors(params.Matchers)
+	if err != nil {
+		return nil, err
+	}
+
+	iters := make([]index.Postings, 0, 1)
+	if selectors.matchesAll() {
+		k, v := index.AllPostingsKey()
+		iter, err := b.index.Postings(k, nil, v)
+		if err != nil {
+			return nil, err
+		}
+		iters = append(iters, iter)
+	} else {
+		for _, matchers := range selectors {
+			iter, err := PostingsForMatchers(b.index, nil, matchers...)
+			if err != nil {
+				return nil, err
+			}
+			iters = append(iters, iter)
+		}
+	}
+
+	valueSet := make(map[string]struct{})
+	iter := index.Intersect(iters...)
+	for iter.Next() {
+		value, err := b.index.LabelValueFor(iter.At(), req.Msg.Name)
+		if err != nil {
+			if err == storage.ErrNotFound {
+				continue
+			}
+			return nil, err
+		}
+		valueSet[value] = struct{}{}
+	}
+
+	values := make([]string, 0, len(valueSet))
+	for value := range valueSet {
+		values = append(values, value)
+	}
+	slices.Sort(values)
+	return connect.NewResponse(&typesv1.LabelValuesResponse{
+		Names: values,
+	}), nil
+}
+
+func (b *singleBlockQuerier) LabelNames(ctx context.Context, req *connect.Request[typesv1.LabelNamesRequest]) (*connect.Response[typesv1.LabelNamesResponse], error) {
+	sp, ctx := opentracing.StartSpanFromContext(ctx, "LabelNames Block")
+	defer sp.Finish()
+
+	params := req.Msg
+
+	err := b.Open(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	selectors, err := parseSelectors(params.Matchers)
+	if err != nil {
+		return nil, err
+	}
+
+	if selectors.matchesAll() {
+		names, err := b.index.LabelNames()
+		if err != nil {
+			return nil, err
+		}
+		return connect.NewResponse(&typesv1.LabelNamesResponse{
+			Names: names,
+		}), nil
+	}
+
+	var iters []index.Postings
+	for _, matchers := range selectors {
+		iter, err := PostingsForMatchers(b.index, nil, matchers...)
+		if err != nil {
+			return nil, err
+		}
+		iters = append(iters, iter)
+	}
+
+	nameSet := make(map[string]struct{})
+	iter := index.Intersect(iters...)
+	for iter.Next() {
+		names, err := b.index.LabelNamesFor(iter.At())
+		if err != nil {
+			if err == storage.ErrNotFound {
+				continue
+			}
+			return nil, err
+		}
+
+		for _, name := range names {
+			nameSet[name] = struct{}{}
+		}
+	}
+
+	names := make([]string, 0, len(nameSet))
+	for name := range nameSet {
+		names = append(names, name)
+	}
+	slices.Sort(names)
+	return connect.NewResponse(&typesv1.LabelNamesResponse{
+		Names: names,
+	}), nil
+}
+
+func (b *singleBlockQuerier) BlockID() string {
+	return b.meta.ULID.String()
 }
 
 func (b *singleBlockQuerier) Close() error {
@@ -382,16 +545,29 @@ type Profile interface {
 
 type Querier interface {
 	Bounds() (model.Time, model.Time)
+
 	SelectMatchingProfiles(ctx context.Context, params *ingestv1.SelectProfilesRequest) (iter.Iterator[Profile], error)
 	MergeByStacktraces(ctx context.Context, rows iter.Iterator[Profile]) (*phlaremodel.Tree, error)
+	MergeBySpans(ctx context.Context, rows iter.Iterator[Profile], spans phlaremodel.SpanSelector) (*phlaremodel.Tree, error)
 	MergeByLabels(ctx context.Context, rows iter.Iterator[Profile], by ...string) ([]*typesv1.Series, error)
 	MergePprof(ctx context.Context, rows iter.Iterator[Profile]) (*profile.Profile, error)
+	Series(ctx context.Context, params *ingestv1.SeriesRequest) ([]*typesv1.Labels, error)
+	ProfileTypes(context.Context, *connect.Request[ingestv1.ProfileTypesRequest]) (*connect.Response[ingestv1.ProfileTypesResponse], error)
+	LabelValues(ctx context.Context, req *connect.Request[typesv1.LabelValuesRequest]) (*connect.Response[typesv1.LabelValuesResponse], error)
+	LabelNames(ctx context.Context, req *connect.Request[typesv1.LabelNamesRequest]) (*connect.Response[typesv1.LabelNamesResponse], error)
 	Open(ctx context.Context) error
 	// Sorts profiles for retrieval.
 	Sort([]Profile) []Profile
+
+	// BlockID returns the block ID of the querier, when it is representing a single block.
+	BlockID() string
 }
 
-func InRange(q Querier, start, end model.Time) bool {
+type TimeBounded interface {
+	Bounds() (model.Time, model.Time)
+}
+
+func InRange(q TimeBounded, start, end model.Time) bool {
 	min, max := q.Bounds()
 	if start > max {
 		return false
@@ -401,6 +577,19 @@ func InRange(q Querier, start, end model.Time) bool {
 	}
 	return true
 }
+
+type ReadAPI interface {
+	LabelValues(context.Context, *connect.Request[typesv1.LabelValuesRequest]) (*connect.Response[typesv1.LabelValuesResponse], error)
+	LabelNames(context.Context, *connect.Request[typesv1.LabelNamesRequest]) (*connect.Response[typesv1.LabelNamesResponse], error)
+	ProfileTypes(context.Context, *connect.Request[ingestv1.ProfileTypesRequest]) (*connect.Response[ingestv1.ProfileTypesResponse], error)
+	Series(context.Context, *connect.Request[ingestv1.SeriesRequest]) (*connect.Response[ingestv1.SeriesResponse], error)
+	MergeProfilesStacktraces(context.Context, *connect.BidiStream[ingestv1.MergeProfilesStacktracesRequest, ingestv1.MergeProfilesStacktracesResponse]) error
+	MergeProfilesLabels(context.Context, *connect.BidiStream[ingestv1.MergeProfilesLabelsRequest, ingestv1.MergeProfilesLabelsResponse]) error
+	MergeProfilesPprof(context.Context, *connect.BidiStream[ingestv1.MergeProfilesPprofRequest, ingestv1.MergeProfilesPprofResponse]) error
+	MergeSpanProfile(context.Context, *connect.BidiStream[ingestv1.MergeSpanProfileRequest, ingestv1.MergeSpanProfileResponse]) error
+}
+
+var _ ReadAPI = make(Queriers, 0)
 
 type Queriers []Querier
 
@@ -427,24 +616,131 @@ func (queriers Queriers) SelectMatchingProfiles(ctx context.Context, params *ing
 	return iter.NewMergeIterator(maxBlockProfile, true, iters...), nil
 }
 
-func (queriers Queriers) ForTimeRange(_ context.Context, start, end model.Time) (Queriers, error) {
+func (queriers Queriers) LabelValues(ctx context.Context, req *connect.Request[typesv1.LabelValuesRequest]) (*connect.Response[typesv1.LabelValuesResponse], error) {
+	blockGetter := queriers.forTimeRange
+	_, hasTimeRange := phlaremodel.GetTimeRange(req.Msg)
+	if !hasTimeRange {
+		blockGetter = func(_ context.Context, _, _ model.Time, _ *ingestv1.Hints) (Queriers, error) {
+			return queriers, nil
+		}
+	}
+	res, err := LabelValues(ctx, req, blockGetter)
+	if err != nil {
+		return nil, err
+	}
+	return connect.NewResponse(res), nil
+}
+
+func (queriers Queriers) LabelNames(ctx context.Context, req *connect.Request[typesv1.LabelNamesRequest]) (*connect.Response[typesv1.LabelNamesResponse], error) {
+	blockGetter := queriers.forTimeRange
+	_, hasTimeRange := phlaremodel.GetTimeRange(req.Msg)
+	if !hasTimeRange {
+		blockGetter = func(_ context.Context, _, _ model.Time, _ *ingestv1.Hints) (Queriers, error) {
+			return queriers, nil
+		}
+	}
+	res, err := LabelNames(ctx, req, blockGetter)
+	if err != nil {
+		return nil, err
+	}
+	return connect.NewResponse(res), nil
+}
+
+func (queriers Queriers) ProfileTypes(ctx context.Context, req *connect.Request[ingestv1.ProfileTypesRequest]) (*connect.Response[ingestv1.ProfileTypesResponse], error) {
+	blockGetter := queriers.forTimeRange
+	_, hasTimeRange := phlaremodel.GetTimeRange(req.Msg)
+	if !hasTimeRange {
+		blockGetter = func(_ context.Context, _, _ model.Time, _ *ingestv1.Hints) (Queriers, error) {
+			return queriers, nil
+		}
+	}
+	res, err := ProfileTypes(ctx, req, blockGetter)
+	if err != nil {
+		return nil, err
+	}
+	return res, nil
+}
+
+func (queriers Queriers) Series(ctx context.Context, req *connect.Request[ingestv1.SeriesRequest]) (*connect.Response[ingestv1.SeriesResponse], error) {
+	// todo: verify empty timestamp request should return all series
+	blockGetter := queriers.forTimeRange
+	// Legacy Series queries without a range should return all series from all head blocks.
+	if req.Msg.Start == 0 || req.Msg.End == 0 {
+		blockGetter = func(_ context.Context, _, _ model.Time, _ *ingestv1.Hints) (Queriers, error) {
+			return queriers, nil
+		}
+	}
+	res, err := Series(ctx, req.Msg, blockGetter)
+	if err != nil {
+		return nil, err
+	}
+	return connect.NewResponse(res), nil
+}
+
+func (queriers Queriers) MergeProfilesStacktraces(ctx context.Context, stream *connect.BidiStream[ingestv1.MergeProfilesStacktracesRequest, ingestv1.MergeProfilesStacktracesResponse]) error {
+	return MergeProfilesStacktraces(ctx, stream, queriers.forTimeRange)
+}
+
+func (queriers Queriers) MergeProfilesLabels(ctx context.Context, stream *connect.BidiStream[ingestv1.MergeProfilesLabelsRequest, ingestv1.MergeProfilesLabelsResponse]) error {
+	return MergeProfilesLabels(ctx, stream, queriers.forTimeRange)
+}
+
+func (queriers Queriers) MergeProfilesPprof(ctx context.Context, stream *connect.BidiStream[ingestv1.MergeProfilesPprofRequest, ingestv1.MergeProfilesPprofResponse]) error {
+	return MergeProfilesPprof(ctx, stream, queriers.forTimeRange)
+}
+
+func (queriers Queriers) MergeSpanProfile(ctx context.Context, stream *connect.BidiStream[ingestv1.MergeSpanProfileRequest, ingestv1.MergeSpanProfileResponse]) error {
+	return MergeSpanProfile(ctx, stream, queriers.forTimeRange)
+}
+
+type BlockGetter func(ctx context.Context, start, end model.Time, hints *ingestv1.Hints) (Queriers, error)
+
+func (queriers Queriers) forTimeRange(_ context.Context, start, end model.Time, hints *ingestv1.Hints) (Queriers, error) {
+	skipBlock := HintsToBlockSkipper(hints)
+
 	result := make(Queriers, 0, len(queriers))
 	for _, q := range queriers {
-		if InRange(q, start, end) {
-			result = append(result, q)
+		if !InRange(q, start, end) {
+			continue
 		}
+
+		if skipBlock(q.BlockID()) {
+			continue
+		}
+
+		result = append(result, q)
 	}
 	return result, nil
 }
 
-type BlockGetter func(ctx context.Context, start, end model.Time) (Queriers, error)
+func HintsToBlockSkipper(hints *ingestv1.Hints) func(ulid string) bool {
+	if hints != nil && hints.Block != nil {
+		m := make(map[string]struct{})
+		for _, blockID := range hints.Block.Ulids {
+			m[blockID] = struct{}{}
+		}
+		return func(ulid string) bool {
+			_, exists := m[ulid]
+			return !exists
+		}
+	}
+
+	// without hints do not skip any block
+	return func(ulid string) bool { return false }
+}
 
 // SelectMatchingProfiles returns a list iterator of profiles matching the given request.
 func SelectMatchingProfiles(ctx context.Context, request *ingestv1.SelectProfilesRequest, queriers Queriers) ([]iter.Iterator[Profile], error) {
 	g, ctx := errgroup.WithContext(ctx)
 	iters := make([]iter.Iterator[Profile], len(queriers))
 
+	skipBlock := HintsToBlockSkipper(request.Hints)
+
 	for i, querier := range queriers {
+		if skipBlock(querier.BlockID()) {
+			iters[i] = iter.NewEmptyIterator[Profile]()
+			continue
+		}
 		i := i
 		querier := querier
 		g.Go(util.RecoverPanic(func() error {
@@ -489,56 +785,106 @@ func MergeProfilesStacktraces(ctx context.Context, stream *connect.BidiStream[in
 		otlog.String("end", model.Time(request.End).Time().String()),
 		otlog.String("selector", request.LabelSelector),
 		otlog.String("profile_id", request.Type.ID),
+		otlog.Object("hints", request.Hints),
 	)
 
-	queriers, err := blockGetter(ctx, model.Time(request.Start), model.Time(request.End))
+	queriers, err := blockGetter(ctx, model.Time(request.Start), model.Time(request.End), request.Hints)
 	if err != nil {
 		return err
 	}
 
-	iters, err := SelectMatchingProfiles(ctx, request, queriers)
-	if err != nil {
-		return err
-	}
-
-	// send batches of profiles to client and filter via bidi stream.
-	selectedProfiles, err := filterProfiles[
-		BidiServerMerge[*ingestv1.MergeProfilesStacktracesResponse, *ingestv1.MergeProfilesStacktracesRequest],
-		*ingestv1.MergeProfilesStacktracesResponse,
-		*ingestv1.MergeProfilesStacktracesRequest](ctx, iters, defaultBatchSize, stream)
-	if err != nil {
-		return err
+	deduplicationNeeded := true
+	if request.Hints != nil && request.Hints.Block != nil {
+		deduplicationNeeded = request.Hints.Block.Deduplication
 	}
 
 	var m sync.Mutex
 	t := new(phlaremodel.Tree)
 	g, ctx := errgroup.WithContext(ctx)
 
-	for i, querier := range queriers {
-		querier := querier
-		i := i
-		if len(selectedProfiles[i]) == 0 {
-			continue
+	// depending on if new need deduplication or not there are two different code paths.
+	if !deduplicationNeeded {
+		// signal the end of the profile streaming by sending an empty response.
+		sp.LogFields(otlog.String("msg", "no profile streaming as no deduplication needed"))
+		if err = stream.Send(&ingestv1.MergeProfilesStacktracesResponse{}); err != nil {
+			return err
 		}
-		// Sort profiles for better read locality.
-		// Merge async the result so we can continue streaming profiles.
-		g.Go(util.RecoverPanic(func() error {
-			merge, err := querier.MergeByStacktraces(ctx, iter.NewSliceIterator(querier.Sort(selectedProfiles[i])))
-			if err != nil {
-				return err
-			}
-			m.Lock()
-			t.Merge(merge)
-			m.Unlock()
-			return nil
-		}))
-	}
 
-	// Signals the end of the profile streaming by sending an empty response.
-	// This allows the client to not block other streaming ingesters.
-	sp.LogFields(otlog.String("msg", "signaling the end of the profile streaming"))
-	if err = stream.Send(&ingestv1.MergeProfilesStacktracesResponse{}); err != nil {
-		return err
+		// in this path we can just merge the profiles from each block and send the result to the client.
+		for _, querier := range queriers {
+			querier := querier
+			g.Go(util.RecoverPanic(func() error {
+				iters, err := querier.SelectMatchingProfiles(ctx, request)
+				if err != nil {
+					return err
+				}
+				defer func() {
+					iters.Close()
+				}()
+
+				profiles, err := iter.Slice(iters)
+				if err != nil {
+					return err
+				}
+
+				if len(profiles) == 0 {
+					return nil
+				}
+
+				// TODO(simonswine): Split profiles per row group and run the MergeByStacktraces in parallel.
+				merge, err := querier.MergeByStacktraces(ctx, iter.NewSliceIterator(querier.Sort(profiles)))
+				if err != nil {
+					return err
+				}
+
+				m.Lock()
+				t.Merge(merge)
+				m.Unlock()
+				return nil
+			}))
+		}
+	} else {
+		// in this path we have to go thorugh every profile and deduplicate them.
+		iters, err := SelectMatchingProfiles(ctx, request, queriers)
+		if err != nil {
+			return err
+		}
+
+		// send batches of profiles to client and filter via bidi stream.
+		selectedProfiles, err := filterProfiles[
+			BidiServerMerge[*ingestv1.MergeProfilesStacktracesResponse, *ingestv1.MergeProfilesStacktracesRequest],
+			*ingestv1.MergeProfilesStacktracesResponse,
+			*ingestv1.MergeProfilesStacktracesRequest](ctx, iters, defaultBatchSize, stream)
+		if err != nil {
+			return err
+		}
+
+		for i, querier := range queriers {
+			querier := querier
+			i := i
+			if len(selectedProfiles[i]) == 0 {
+				continue
+			}
+			// Sort profiles for better read locality.
+			// Merge async the result so we can continue streaming profiles.
+			g.Go(util.RecoverPanic(func() error {
+				merge, err := querier.MergeByStacktraces(ctx, iter.NewSliceIterator(querier.Sort(selectedProfiles[i])))
+				if err != nil {
+					return err
+				}
+				m.Lock()
+				t.Merge(merge)
+				m.Unlock()
+				return nil
+			}))
+		}
+
+		// Signals the end of the profile streaming by sending an empty response.
+		// This allows the client to not block other streaming ingesters.
+		sp.LogFields(otlog.String("msg", "signaling the end of the profile streaming"))
+		if err = stream.Send(&ingestv1.MergeProfilesStacktracesResponse{}); err != nil {
+			return err
+		}
 	}
 
 	if err = g.Wait(); err != nil {
@@ -555,6 +901,114 @@ func MergeProfilesStacktraces(ctx context.Context, stream *connect.BidiStream[in
 	err = stream.Send(&ingestv1.MergeProfilesStacktracesResponse{
 		Result: &ingestv1.MergeProfilesStacktracesResult{
 			Format:    ingestv1.StacktracesMergeFormat_MERGE_FORMAT_TREE,
+			TreeBytes: buf.Bytes(),
+		},
+	})
+	if err != nil {
+		if errors.Is(err, io.EOF) {
+			return connect.NewError(connect.CodeCanceled, errors.New("client closed stream"))
+		}
+		return err
+	}
+
+	return nil
+}
+
+func MergeSpanProfile(ctx context.Context, stream *connect.BidiStream[ingestv1.MergeSpanProfileRequest, ingestv1.MergeSpanProfileResponse], blockGetter BlockGetter) error {
+	sp, ctx := opentracing.StartSpanFromContext(ctx, "MergeSpanProfile")
+	defer sp.Finish()
+
+	r, err := stream.Receive()
+	if err != nil {
+		if errors.Is(err, io.EOF) {
+			return connect.NewError(connect.CodeCanceled, errors.New("client closed stream"))
+		}
+		return err
+	}
+
+	if r.Request == nil {
+		return connect.NewError(connect.CodeInvalidArgument, errors.New("missing initial select request"))
+	}
+	request := r.Request
+	sp.LogFields(
+		otlog.String("start", model.Time(request.Start).Time().String()),
+		otlog.String("end", model.Time(request.End).Time().String()),
+		otlog.String("selector", request.LabelSelector),
+		otlog.String("profile_type_id", request.Type.ID),
+	)
+
+	spanSelector, err := phlaremodel.NewSpanSelector(request.SpanSelector)
+	if err != nil {
+		return err
+	}
+
+	queriers, err := blockGetter(ctx, model.Time(request.Start), model.Time(request.End), nil)
+	if err != nil {
+		return err
+	}
+
+	iters, err := SelectMatchingProfiles(ctx, &ingestv1.SelectProfilesRequest{
+		LabelSelector: request.LabelSelector,
+		Type:          request.Type,
+		Start:         request.Start,
+		End:           request.End,
+	}, queriers)
+	if err != nil {
+		return err
+	}
+
+	// send batches of profiles to client and filter via bidi stream.
+	selectedProfiles, err := filterProfiles[
+		BidiServerMerge[*ingestv1.MergeSpanProfileResponse, *ingestv1.MergeSpanProfileRequest],
+		*ingestv1.MergeSpanProfileResponse,
+		*ingestv1.MergeSpanProfileRequest](ctx, iters, defaultBatchSize, stream)
+	if err != nil {
+		return err
+	}
+
+	var m sync.Mutex
+	t := new(phlaremodel.Tree)
+	g, ctx := errgroup.WithContext(ctx)
+	for i, querier := range queriers {
+		querier := querier
+		i := i
+		if len(selectedProfiles[i]) == 0 {
+			continue
+		}
+		// Sort profiles for better read locality.
+		// Merge async the result so we can continue streaming profiles.
+		g.Go(util.RecoverPanic(func() error {
+			merge, err := querier.MergeBySpans(ctx, iter.NewSliceIterator(querier.Sort(selectedProfiles[i])), spanSelector)
+			if err != nil {
+				return err
+			}
+			m.Lock()
+			t.Merge(merge)
+			m.Unlock()
+			return nil
+		}))
+	}
+
+	// Signals the end of the profile streaming by sending an empty response.
+	// This allows the client to not block other streaming ingesters.
+	sp.LogFields(otlog.String("msg", "signaling the end of the profile streaming"))
+	if err = stream.Send(&ingestv1.MergeSpanProfileResponse{}); err != nil {
+		return err
+	}
+
+	if err = g.Wait(); err != nil {
+		return err
+	}
+
+	var buf bytes.Buffer
+	if err = t.MarshalTruncate(&buf, r.GetMaxNodes()); err != nil {
+		return err
+	}
+
+	// sends the final result to the client.
+	sp.LogFields(otlog.String("msg", "sending the final result to the client"))
+	err = stream.Send(&ingestv1.MergeSpanProfileResponse{
+		Result: &ingestv1.MergeSpanProfileResult{
 			TreeBytes: buf.Bytes(),
 		},
 	})
@@ -594,54 +1048,98 @@ func MergeProfilesLabels(ctx context.Context, stream *connect.BidiStream[ingestv
 		otlog.String("by", strings.Join(by, ",")),
 	)
 
-	queriers, err := blockGetter(ctx, model.Time(request.Start), model.Time(request.End))
+	queriers, err := blockGetter(ctx, model.Time(request.Start), model.Time(request.End), request.Hints)
 	if err != nil {
 		return err
 	}
-
-	iters, err := SelectMatchingProfiles(ctx, request, queriers)
-	if err != nil {
-		return err
-	}
-	// send batches of profiles to client and filter via bidi stream.
-	selectedProfiles, err := filterProfiles[
-		BidiServerMerge[*ingestv1.MergeProfilesLabelsResponse, *ingestv1.MergeProfilesLabelsRequest],
-		*ingestv1.MergeProfilesLabelsResponse,
-		*ingestv1.MergeProfilesLabelsRequest](ctx, iters, defaultBatchSize, stream)
-	if err != nil {
-		return err
-	}
-
-	// Signals the end of the profile streaming by sending an empty request.
-	// This allows the client to not block other streaming ingesters.
-	if err := stream.Send(&ingestv1.MergeProfilesLabelsResponse{}); err != nil {
-		return err
-	}
-
 	result := make([][]*typesv1.Series, 0, len(queriers))
 	g, ctx := errgroup.WithContext(ctx)
 	sync := lo.Synchronize()
-	for i, querier := range queriers {
-		i := i
-		querier := querier
-		if len(selectedProfiles[i]) == 0 {
-			continue
-		}
-		// Sort profiles for better read locality.
-		// And merge async the result for each queriers.
-		g.Go(util.RecoverPanic(func() error {
-			merge, err := querier.MergeByLabels(ctx,
-				iter.NewSliceIterator(querier.Sort(selectedProfiles[i])),
-				by...)
-			if err != nil {
-				return err
-			}
-			sync.Do(func() {
-				result = append(result, merge)
-			})
 
-			return nil
-		}))
+	deduplicationNeeded := true
+	if request.Hints != nil && request.Hints.Block != nil {
+		deduplicationNeeded = request.Hints.Block.Deduplication
+	}
+
+	if !deduplicationNeeded {
+		// signal the end of the profile streaming by sending an empty response.
+		sp.LogFields(otlog.String("msg", "no profile streaming as no deduplication needed"))
+		if err = stream.Send(&ingestv1.MergeProfilesLabelsResponse{}); err != nil {
+			return err
+		}
+		// in this path we can just merge the profiles from each block and send the result to the client.
+		for _, querier := range queriers {
+			querier := querier
+			g.Go(util.RecoverPanic(func() error {
+				iters, err := querier.SelectMatchingProfiles(ctx, request)
+				if err != nil {
+					return err
+				}
+				defer func() {
+					iters.Close()
+				}()
+
+				profiles, err := iter.Slice(iters)
+				if err != nil {
+					return err
+				}
+
+				if len(profiles) == 0 {
+					return nil
+				}
+
+				merge, err := querier.MergeByLabels(ctx, iter.NewSliceIterator(querier.Sort(profiles)), by...)
+				if err != nil {
+					return err
+				}
+
+				sync.Do(func() {
+					result = append(result, merge)
+				})
+				return nil
+			}))
+		}
+	} else {
+		iters, err := SelectMatchingProfiles(ctx, request, queriers)
+		if err != nil {
+			return err
+		}
+		// send batches of profiles to client and filter via bidi stream.
+		selectedProfiles, err := filterProfiles[
+			BidiServerMerge[*ingestv1.MergeProfilesLabelsResponse, *ingestv1.MergeProfilesLabelsRequest],
+			*ingestv1.MergeProfilesLabelsResponse,
+			*ingestv1.MergeProfilesLabelsRequest](ctx, iters, defaultBatchSize, stream)
+		if err != nil {
+			return err
+		}
+
+		// Signals the end of the profile streaming by sending an empty request.
+		// This allows the client to not block other streaming ingesters.
+		if err := stream.Send(&ingestv1.MergeProfilesLabelsResponse{}); err != nil {
+			return err
+		}
+		for i, querier := range queriers {
+			i := i
+			querier := querier
+			if len(selectedProfiles[i]) == 0 {
+				continue
+			}
+			// Sort profiles for better read locality.
+			// And merge async the result for each queriers.
+			g.Go(util.RecoverPanic(func() error {
+				merge, err := querier.MergeByLabels(ctx,
+					iter.NewSliceIterator(querier.Sort(selectedProfiles[i])),
+					by...)
+				if err != nil {
+					return err
+				}
+				sync.Do(func() {
+					result = append(result, merge)
+				})
+
+				return nil
+			}))
+		}
 	}
 
 	if err := g.Wait(); err != nil {
@@ -683,59 +1181,112 @@ func MergeProfilesPprof(ctx context.Context, stream *connect.BidiStream[ingestv1
 		otlog.String("end", model.Time(request.End).Time().String()),
 		otlog.String("selector", request.LabelSelector),
 		otlog.String("profile_id", request.Type.ID),
+		otlog.Object("hints", request.Hints),
 	)
 
-	queriers, err := blockGetter(ctx, model.Time(request.Start), model.Time(request.End))
+	queriers, err := blockGetter(ctx, model.Time(request.Start), model.Time(request.End), request.Hints)
 	if err != nil {
 		return err
 	}
 
-	iters, err := SelectMatchingProfiles(ctx, request, queriers)
-	if err != nil {
-		return err
+	deduplicationNeeded := true
+	if request.Hints != nil && request.Hints.Block != nil {
+		deduplicationNeeded = request.Hints.Block.Deduplication
 	}
 
-	// send batches of profiles to client and filter via bidi stream.
-	selectedProfiles, err := filterProfiles[
-		BidiServerMerge[*ingestv1.MergeProfilesPprofResponse, *ingestv1.MergeProfilesPprofRequest],
-		*ingestv1.MergeProfilesPprofResponse,
-		*ingestv1.MergeProfilesPprofRequest](ctx, iters, defaultBatchSize, stream)
-	if err != nil {
-		return err
-	}
-
-	result := make([]*profile.Profile, 0, len(queriers))
 	var lock sync.Mutex
+	result := make([]*profile.Profile, 0, len(queriers))
 	g, ctx := errgroup.WithContext(ctx)
-	for i, querier := range queriers {
-		i := i
-		querier := querier
-		if len(selectedProfiles[i]) == 0 {
-			continue
+
+	// depending on if new need deduplication or not there are two different code paths.
+	if !deduplicationNeeded {
+		// signal the end of the profile streaming by sending an empty response.
+		sp.LogFields(otlog.String("msg", "no profile streaming as no deduplication needed"))
+		if err = stream.Send(&ingestv1.MergeProfilesPprofResponse{}); err != nil {
+			return err
 		}
-		// Sort profiles for better read locality.
-		// Merge async the result so we can continue streaming profiles.
-		g.Go(util.RecoverPanic(func() error {
-			merge, err := querier.MergePprof(ctx, iter.NewSliceIterator(querier.Sort(selectedProfiles[i])))
-			if err != nil {
-				return err
+
+		// in this path we can just merge the profiles from each block and send the result to the client.
+		for _, querier := range queriers {
+			querier := querier
+			g.Go(util.RecoverPanic(func() error {
+
+				iters, err := querier.SelectMatchingProfiles(ctx, request)
+				if err != nil {
+					return err
+				}
+				defer func() {
+					iters.Close()
+				}()
+
+				profiles, err := iter.Slice(iters)
+				if err != nil {
+					return err
+				}
+
+				if len(profiles) == 0 {
+					return nil
+				}
+
+				merge, err := querier.MergePprof(ctx, iter.NewSliceIterator(querier.Sort(profiles)))
+				if err != nil {
+					return err
+				}
+
+				lock.Lock()
+				result = append(result, merge)
+				lock.Unlock()
+				return nil
+			}))
+		}
+	} else {
+		// in this path we have to go thorugh every profile and deduplicate them.
+		iters, err := SelectMatchingProfiles(ctx, request, queriers)
+		if err != nil {
+			return err
+		}
+
+		// send batches of profiles to client and filter via bidi stream.
+		selectedProfiles, err := filterProfiles[
+			BidiServerMerge[*ingestv1.MergeProfilesPprofResponse, *ingestv1.MergeProfilesPprofRequest],
+			*ingestv1.MergeProfilesPprofResponse,
+			*ingestv1.MergeProfilesPprofRequest](ctx, iters, defaultBatchSize, stream)
+		if err != nil {
+			return err
+		}
+
+		for i, querier := range queriers {
+			querier := querier
+			i := i
+			if len(selectedProfiles[i]) == 0 {
+				continue
 			}
-			lock.Lock()
-			defer lock.Unlock()
-			result = append(result, merge)
-			return nil
-		}))
+			// Sort profiles for better read locality.
+			// Merge async the result so we can continue streaming profiles.
+			g.Go(util.RecoverPanic(func() error {
+				merge, err := querier.MergePprof(ctx, iter.NewSliceIterator(querier.Sort(selectedProfiles[i])))
+				if err != nil {
+					return err
+				}
+				lock.Lock()
+				result = append(result, merge)
+				lock.Unlock()
+				return nil
+			}))
+		}
+
+		// Signals the end of the profile streaming by sending an empty response.
+		// This allows the client to not block other streaming ingesters.
+		sp.LogFields(otlog.String("msg", "signaling the end of the profile streaming"))
+		if err = stream.Send(&ingestv1.MergeProfilesPprofResponse{}); err != nil {
+			return err
+		}
 	}
 
-	// Signals the end of the profile streaming by sending an empty response.
-	// This allows the client to not block other streaming ingesters.
-	if err := stream.Send(&ingestv1.MergeProfilesPprofResponse{}); err != nil {
+	if err = g.Wait(); err != nil {
 		return err
 	}
 
-	if err := g.Wait(); err != nil {
-		return err
-	}
 	if len(result) == 0 {
 		result = append(result, &profile.Profile{})
 	}
@@ -765,6 +1316,159 @@ func MergeProfilesPprof(ctx context.Context, stream *connect.BidiStream[ingestv1
 	}
 
 	return nil
+}
+
+func ProfileTypes(ctx context.Context, req *connect.Request[ingestv1.ProfileTypesRequest], blockGetter BlockGetter) (*connect.Response[ingestv1.ProfileTypesResponse], error) {
+	queriers, err := blockGetter(ctx, model.Time(req.Msg.Start), model.Time(req.Msg.End), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	g, ctx := errgroup.WithContext(ctx)
+	uniqTypes := make(map[string]*typesv1.ProfileType)
+	lock := sync.Mutex{}
+
+	for _, q := range queriers {
+		q := q
+		g.Go(func() error {
+			res, err := q.ProfileTypes(ctx, req)
+			if err != nil {
+				return err
+			}
+
+			lock.Lock()
+			defer lock.Unlock()
+			for _, t := range res.Msg.ProfileTypes {
+				uniqTypes[t.ID] = t.CloneVT()
+			}
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+	types := lo.Values(uniqTypes)
+	sort.Slice(types, func(i, j int) bool {
+		return types[i].ID < types[j].ID
+	})
+	return connect.NewResponse(&ingestv1.ProfileTypesResponse{
+		ProfileTypes: types,
+	}), nil
+}
+
+func LabelValues(ctx context.Context, req *connect.Request[typesv1.LabelValuesRequest], blockGetter BlockGetter) (*typesv1.LabelValuesResponse, error) {
+	queriers, err := blockGetter(ctx, model.Time(req.Msg.Start), model.Time(req.Msg.End), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	var values []string
+	var lock sync.Mutex
+	group, ctx := errgroup.WithContext(ctx)
+
+	const concurrentQueryLimit = 50
+	group.SetLimit(concurrentQueryLimit)
+
+	for _, q := range queriers {
+		group.Go(util.RecoverPanic(func() error {
+			res, err := q.LabelValues(ctx, req)
+			if err != nil {
+				return err
+			}
+
+			lock.Lock()
+			values = append(values, res.Msg.Names...)
+			lock.Unlock()
+			return nil
+		}))
+	}
+	err = group.Wait()
+	if err != nil {
+		return nil, err
+	}
+
+	slices.Sort(values)
+	return &typesv1.LabelValuesResponse{Names: lo.Uniq(values)}, nil
+}
+
+func LabelNames(ctx context.Context, req *connect.Request[typesv1.LabelNamesRequest], blockGetter BlockGetter) (*typesv1.LabelNamesResponse, error) {
+	queriers, err := blockGetter(ctx, model.Time(req.Msg.Start), model.Time(req.Msg.End), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	var labelNames []string
+	var lock sync.Mutex
+	group, ctx := errgroup.WithContext(ctx)
+
+	const concurrentQueryLimit = 50
+	group.SetLimit(concurrentQueryLimit)
+
+	for _, q := range queriers {
+		group.Go(util.RecoverPanic(func() error {
+			res, err := q.LabelNames(ctx, req)
+			if err != nil {
+				return err
+			}
+
+			lock.Lock()
+			labelNames = append(labelNames, res.Msg.Names...)
+			lock.Unlock()
+			return nil
+		}))
+	}
+	err = group.Wait()
+	if err != nil {
+		return nil, err
+	}
+
+	slices.Sort(labelNames)
+	return &typesv1.LabelNamesResponse{
+		Names: lo.Uniq(labelNames),
+	}, nil
+}
+
+func Series(ctx context.Context, req *ingestv1.SeriesRequest, blockGetter BlockGetter) (*ingestv1.SeriesResponse, error) {
+	queriers, err := blockGetter(ctx, model.Time(req.Start), model.Time(req.End), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	var labelsSet []*typesv1.Labels
+	var lock sync.Mutex
+	group, ctx := errgroup.WithContext(ctx)
+
+	// TODO(bryan) Verify this limit is ok
+	const concurrentQueryLimit = 50
+	group.SetLimit(concurrentQueryLimit)
+
+	for _, q := range queriers {
+		q := q
+		group.Go(util.RecoverPanic(func() error {
+			labels, err := q.Series(ctx, req)
+			if err != nil {
+				return err
+			}
+
+			lock.Lock()
+			labelsSet = append(labelsSet, labels...)
+			lock.Unlock()
+			return nil
+		}))
+	}
+	err = group.Wait()
+	if err != nil {
+		return nil, err
+	}
+
+	sort.Slice(labelsSet, func(i, j int) bool {
+		return phlaremodel.CompareLabelPairs(labelsSet[i].Labels, labelsSet[j].Labels) < 0
+	})
+	return &ingestv1.SeriesResponse{
+		LabelsSet: lo.UniqBy(labelsSet, func(set *typesv1.Labels) uint64 {
+			return phlaremodel.Labels(set.Labels).Hash()
+		}),
+	}, nil
 }
 
 var maxBlockProfile Profile = BlockProfile{
@@ -811,6 +1515,8 @@ func retrieveStacktracePartition(buf [][]parquet.Value, pos int) uint64 {
 func (b *singleBlockQuerier) SelectMatchingProfiles(ctx context.Context, params *ingestv1.SelectProfilesRequest) (iter.Iterator[Profile], error) {
 	sp, ctx := opentracing.StartSpanFromContext(ctx, "SelectMatchingProfiles - Block")
 	defer sp.Finish()
+	sp.SetTag("block ULID", b.meta.ULID.String())
+
 	if err := b.Open(ctx); err != nil {
 		return nil, err
 	}
@@ -903,6 +1609,103 @@ func (b *singleBlockQuerier) SelectMatchingProfiles(ctx context.Context, params 
 	}
 
 	return iter.NewMergeIterator(maxBlockProfile, false, iters...), nil
+}
+
+// Series selects the series labels from this block.
+//
+// Note: It will select ALL the labels in the block, not necessarily just the
+// subset in the time range SeriesRequest.Start to SeriesRequest.End.
+func (b *singleBlockQuerier) Series(ctx context.Context, params *ingestv1.SeriesRequest) ([]*typesv1.Labels, error) {
+	sp, ctx := opentracing.StartSpanFromContext(ctx, "Series Block")
+	defer sp.Finish()
+
+	err := b.Open(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	selectors, err := parseSelectors(params.Matchers)
+	if err != nil {
+		return nil, err
+	}
+
+	names, err := b.index.LabelNames()
+	if err != nil {
+		return nil, err
+	}
+
+	if len(params.LabelNames) > 0 {
+		labelNamesFilter := make(map[string]struct{}, len(params.LabelNames))
+		for _, n := range params.LabelNames {
+			labelNamesFilter[n] = struct{}{}
+		}
+		names = lo.Filter(names, func(name string, _ int) bool {
+			_, ok := labelNamesFilter[name]
+			return ok
+		})
+	}
+
+	var labelsSets []*typesv1.Labels
+	fingerprints := make(map[uint64]struct{})
+	if selectors.matchesAll() {
+		k, v := index.AllPostingsKey()
+		iter, err := b.index.Postings(k, nil, v)
+		if err != nil {
+			return nil, err
+		}
+
+		sets, err := b.getUniqueLabelsSets(iter, names, &fingerprints)
+		if err != nil {
+			return nil, err
+		}
+		labelsSets = append(labelsSets, sets...)
+	} else {
+		for _, matchers := range selectors {
+			iter, err := PostingsForMatchers(b.index, nil, matchers...)
+			if err != nil {
+				return nil, err
+			}
+
+			sets, err := b.getUniqueLabelsSets(iter, names, &fingerprints)
+			if err != nil {
+				return nil, err
+			}
+			labelsSets = append(labelsSets, sets...)
+		}
+	}
+	return labelsSets, nil
+}
+
+func (b *singleBlockQuerier) getUniqueLabelsSets(postings index.Postings, names []string, fingerprints *map[uint64]struct{}) ([]*typesv1.Labels, error) {
+	var labelsSets []*typesv1.Labels
+	for postings.Next() {
+		matchedLabels := make(phlaremodel.Labels, 0, len(names))
+		for _, name := range names {
+			value, err := b.index.LabelValueFor(postings.At(), name)
+			if err != nil {
+				if err == storage.ErrNotFound {
+					continue
+				}
+				return nil, err
+			}
+			matchedLabels = append(matchedLabels, &typesv1.LabelPair{
+				Name:  name,
+				Value: value,
+			})
+		}
+
+		fp := matchedLabels.Hash()
+		_, ok := (*fingerprints)[fp]
+		if ok {
+			continue
+		}
+		(*fingerprints)[fp] = struct{}{}
+
+		labelsSets = append(labelsSets, &typesv1.Labels{
+			Labels: matchedLabels,
+		})
+	}
+	return labelsSets, nil
 }
 
 func (b *singleBlockQuerier) Sort(in []Profile) []Profile {
@@ -1001,7 +1804,7 @@ func (q *singleBlockQuerier) openFiles(ctx context.Context) error {
 		case block.MetaVersion3:
 			q.symbols, err = symdb.Open(ctx, q.bucket, q.meta)
 		default:
-			panic(fmt.Errorf("unsupported block version %d", q.meta.Version))
+			panic(fmt.Errorf("unsupported block version %d id %s", q.meta.Version, q.meta.ULID.String()))
 		}
 		return err
 	}))
@@ -1011,60 +1814,25 @@ func (q *singleBlockQuerier) openFiles(ctx context.Context) error {
 
 type parquetReader[M schemav1.Models, P schemav1.PersisterName] struct {
 	persister P
-	file      *parquet.File
-	reader    phlareobj.ReaderAtCloser
-	size      int64
+	file      parquetobj.File
+	meta      block.File
 	metrics   *blocksMetrics
 }
 
 func (r *parquetReader[M, P]) open(ctx context.Context, bucketReader phlareobj.BucketReader) error {
 	r.metrics = contextBlockMetrics(ctx)
-	filePath := r.persister.Name() + block.ParquetSuffix
-
-	if r.size == 0 {
-		attrs, err := bucketReader.Attributes(ctx, filePath)
-		if err != nil {
-			return errors.Wrapf(err, "getting attributes for '%s'", filePath)
-		}
-		r.size = attrs.Size
-	}
-	// the same reader is used to serve all requests, so we pass context.Background() here
-	ra, err := bucketReader.ReaderAt(context.Background(), filePath)
-	if err != nil {
-		return errors.Wrapf(err, "create reader '%s'", filePath)
-	}
-	ra = parquetobj.NewOptimizedReader(ra)
-	r.reader = ra
-
-	// first try to open file, this is required otherwise OpenFile panics
-	parquetFile, err := parquet.OpenFile(ra, r.size, parquet.SkipPageIndex(true), parquet.SkipBloomFilters(true))
-	if err != nil {
-		return errors.Wrapf(err, "opening parquet file '%s'", filePath)
-	}
-	if parquetFile.NumRows() == 0 {
-		return fmt.Errorf("error parquet file '%s' contains no rows", filePath)
-	}
-	opts := []parquet.FileOption{
+	return r.file.Open(
+		ctx,
+		bucketReader,
+		r.meta,
 		parquet.SkipBloomFilters(true), // we don't use bloom filters
 		parquet.FileReadMode(parquet.ReadModeAsync),
 		parquet.ReadBufferSize(parquetReadBufferSize),
-	}
-	// now open it for real
-	r.file, err = parquet.OpenFile(ra, r.size, opts...)
-	if err != nil {
-		return errors.Wrapf(err, "opening parquet file '%s'", filePath)
-	}
-
-	return nil
+	)
 }
 
 func (r *parquetReader[M, P]) Close() error {
-	if r.reader != nil {
-		return r.reader.Close()
-	}
-	r.reader = nil
-	r.file = nil
-	return nil
+	return r.file.Close()
 }
 
 func (r *parquetReader[M, P]) relPath() string {
@@ -1072,20 +1840,10 @@ func (r *parquetReader[M, P]) relPath() string {
 }
 
 func (r *parquetReader[M, P]) columnIter(ctx context.Context, columnName string, predicate query.Predicate, alias string) query.Iterator {
-	index, _ := query.GetColumnIndexByPath(r.file, columnName)
+	index, _ := query.GetColumnIndexByPath(r.file.File, columnName)
 	if index == -1 {
 		return query.NewErrIterator(fmt.Errorf("column '%s' not found in parquet file '%s'", columnName, r.relPath()))
 	}
 	ctx = query.AddMetricsToContext(ctx, r.metrics.query)
 	return query.NewSyncIterator(ctx, r.file.RowGroups(), index, columnName, 1000, predicate, alias)
-}
-
-func repeatedColumnIter[T any](ctx context.Context, source Source, columnName string, rows iter.Iterator[T]) iter.Iterator[*query.RepeatedRow[T]] {
-	column, found := source.Schema().Lookup(strings.Split(columnName, ".")...)
-	if !found {
-		return iter.NewErrIterator[*query.RepeatedRow[T]](fmt.Errorf("column '%s' not found in parquet file", columnName))
-	}
-
-	opentracing.SpanFromContext(ctx).SetTag("columnName", columnName)
-	return query.NewRepeatedPageIterator(ctx, rows, source.RowGroups(), column.ColumnIndex, 1e4)
 }

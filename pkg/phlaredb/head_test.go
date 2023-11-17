@@ -13,7 +13,6 @@ import (
 	"github.com/oklog/ulid"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/model"
-	"github.com/prometheus/prometheus/tsdb"
 	"github.com/stretchr/testify/require"
 
 	profilev1 "github.com/grafana/pyroscope/api/gen/proto/go/google/v1"
@@ -288,10 +287,11 @@ func TestHeadFlush(t *testing.T) {
 			MinTime: head.meta.MinTime,
 			MaxTime: head.meta.MaxTime,
 			Stats: block.BlockStats{
-				NumSamples:  9479,
+				NumSamples:  14192,
 				NumSeries:   8,
 				NumProfiles: 11,
 			},
+			Labels: map[string]string{},
 			Files: []block.File{
 				{
 					RelPath:   "index.tsdb",
@@ -301,16 +301,14 @@ func TestHeadFlush(t *testing.T) {
 					},
 				},
 				{
-					RelPath:   "profiles.parquet",
-					SizeBytes: 40728,
+					RelPath: "profiles.parquet",
 					Parquet: &block.ParquetFile{
 						NumRowGroups: 1,
 						NumRows:      11,
 					},
 				},
 				{
-					RelPath:   "symbols/functions.parquet",
-					SizeBytes: 57957,
+					RelPath: "symbols/functions.parquet",
 					Parquet: &block.ParquetFile{
 						NumRowGroups: 2,
 						NumRows:      1423,
@@ -321,16 +319,14 @@ func TestHeadFlush(t *testing.T) {
 					SizeBytes: 308,
 				},
 				{
-					RelPath:   "symbols/locations.parquet",
-					SizeBytes: 107486,
+					RelPath: "symbols/locations.parquet",
 					Parquet: &block.ParquetFile{
 						NumRowGroups: 2,
 						NumRows:      2469,
 					},
 				},
 				{
-					RelPath:   "symbols/mappings.parquet",
-					SizeBytes: 1866,
+					RelPath: "symbols/mappings.parquet",
 					Parquet: &block.ParquetFile{
 						NumRowGroups: 2,
 						NumRows:      3,
@@ -341,15 +337,14 @@ func TestHeadFlush(t *testing.T) {
 					SizeBytes: 60366,
 				},
 				{
-					RelPath:   "symbols/strings.parquet",
-					SizeBytes: 83838,
+					RelPath: "symbols/strings.parquet",
 					Parquet: &block.ParquetFile{
 						NumRowGroups: 2,
-						NumRows:      1723,
+						NumRows:      1722,
 					},
 				},
 			},
-			Compaction: tsdb.BlockMetaCompaction{
+			Compaction: block.BlockMetaCompaction{
 				Level: 1,
 				Sources: []ulid.ULID{
 					head.meta.ULID,
@@ -357,6 +352,16 @@ func TestHeadFlush(t *testing.T) {
 			},
 			Version: 3,
 		},
+	}
+
+	// Parquet files are not deterministic, their size can change for the same input so we don't check them.
+	for i := range metas {
+		for j := range metas[i].Files {
+			if metas[i].Files[j].Parquet != nil && metas[i].Files[j].Parquet.NumRows != 0 {
+				require.NotEmpty(t, metas[i].Files[j].SizeBytes)
+				metas[i].Files[j].SizeBytes = 0
+			}
+		}
 	}
 
 	require.Equal(t, expectedMeta, metas)
@@ -443,6 +448,19 @@ func TestHead_Concurrent_Ingest_Querying(t *testing.T) {
 	// TODO: We need to test if flushing misses out on ingested profiles
 
 	wg.Wait()
+}
+
+func TestIsStale(t *testing.T) {
+	head := newTestHead(t)
+	now := time.Unix(0, time.Minute.Nanoseconds())
+
+	// should not be stale if have not past the stale grace period
+	head.updatedAt.Store(time.Unix(0, 0))
+	require.False(t, head.isStale(now.UnixNano(), now))
+	// should be stale as we have passed the stale grace period
+	require.True(t, head.isStale(now.UnixNano(), now.Add(2*StaleGracePeriod)))
+	// Should not be stale if maxT is not passed.
+	require.False(t, head.isStale(now.Add(2*StaleGracePeriod).UnixNano(), now.Add(2*StaleGracePeriod)))
 }
 
 func BenchmarkHeadIngestProfiles(t *testing.B) {

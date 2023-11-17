@@ -6,6 +6,7 @@ import (
 	_ "net/http/pprof"
 	"os"
 	"path/filepath"
+	"sort"
 	"testing"
 	"time"
 
@@ -13,7 +14,7 @@ import (
 	"github.com/parquet-go/parquet-go"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/storage"
-	"github.com/prometheus/prometheus/tsdb"
+	"github.com/samber/lo"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -23,6 +24,7 @@ import (
 	"github.com/grafana/pyroscope/pkg/objstore/client"
 	"github.com/grafana/pyroscope/pkg/objstore/providers/filesystem"
 	"github.com/grafana/pyroscope/pkg/phlaredb/block"
+	"github.com/grafana/pyroscope/pkg/phlaredb/sharding"
 	"github.com/grafana/pyroscope/pkg/phlaredb/tsdb/index"
 	"github.com/grafana/pyroscope/pkg/pprof/testhelper"
 )
@@ -83,6 +85,152 @@ func TestCompact(t *testing.T) {
 	expected := new(phlaremodel.Tree)
 	expected.InsertStack(3, "baz", "bar", "foo")
 	require.Equal(t, expected.String(), res.String())
+}
+
+func TestCompactWithSplitting(t *testing.T) {
+	ctx := context.Background()
+
+	b1 := newBlock(t, func() []*testhelper.ProfileBuilder {
+		return append(
+			profileSeriesGenerator(t, time.Unix(1, 0), time.Unix(10, 0), time.Second, "job", "a"),
+			profileSeriesGenerator(t, time.Unix(11, 0), time.Unix(20, 0), time.Second, "job", "b")...,
+		)
+	})
+	b2 := newBlock(t, func() []*testhelper.ProfileBuilder {
+		return append(
+			append(
+				append(
+					profileSeriesGenerator(t, time.Unix(1, 0), time.Unix(10, 0), time.Second, "job", "c"),
+					profileSeriesGenerator(t, time.Unix(11, 0), time.Unix(20, 0), time.Second, "job", "d")...,
+				), profileSeriesGenerator(t, time.Unix(1, 0), time.Unix(10, 0), time.Second, "job", "a")...,
+			),
+			profileSeriesGenerator(t, time.Unix(11, 0), time.Unix(20, 0), time.Second, "job", "b")...,
+		)
+	})
+	dst := t.TempDir()
+	compacted, err := CompactWithSplitting(ctx, []BlockReader{b1, b2, b2, b1}, 16, 8, dst, SplitByFingerprint)
+	require.NoError(t, err)
+
+	// 4 shards one per series.
+	require.Equal(t, 4, len(compacted))
+	require.Equal(t, "1_of_16", compacted[0].Labels[sharding.CompactorShardIDLabel])
+	require.Equal(t, "6_of_16", compacted[1].Labels[sharding.CompactorShardIDLabel])
+	require.Equal(t, "7_of_16", compacted[2].Labels[sharding.CompactorShardIDLabel])
+	require.Equal(t, "14_of_16", compacted[3].Labels[sharding.CompactorShardIDLabel])
+
+	require.Equal(t, model.TimeFromUnix(1), compacted[1].MinTime)
+	require.Equal(t, model.TimeFromUnix(20), compacted[1].MaxTime)
+
+	// We first verify we have all series and timestamps across querying all blocks.
+	queriers := make(Queriers, len(compacted))
+	for i, blk := range compacted {
+		queriers[i] = blockQuerierFromMeta(t, dst, blk)
+	}
+
+	err = queriers.Open(context.Background())
+	require.NoError(t, err)
+	matchAll := &ingesterv1.SelectProfilesRequest{
+		LabelSelector: "{}",
+		Type:          mustParseProfileSelector(t, "process_cpu:cpu:nanoseconds:cpu:nanoseconds"),
+		Start:         0,
+		End:           40000,
+	}
+	it, err := queriers.SelectMatchingProfiles(context.Background(), matchAll)
+	require.NoError(t, err)
+
+	seriesMap := make(map[model.Fingerprint]lo.Tuple2[phlaremodel.Labels, []model.Time])
+	for it.Next() {
+		r := it.At()
+		seriesMap[r.Fingerprint()] = lo.T2(r.Labels().WithoutPrivateLabels(), append(seriesMap[r.Fingerprint()].B, r.Timestamp()))
+	}
+	require.NoError(t, it.Err())
+	require.NoError(t, it.Close())
+	series := lo.Values(seriesMap)
+	sort.Slice(series, func(i, j int) bool {
+		return phlaremodel.CompareLabelPairs(series[i].A, series[j].A) < 0
+	})
+	require.Equal(t, []lo.Tuple2[phlaremodel.Labels, []model.Time]{
+		lo.T2(phlaremodel.LabelsFromStrings("job", "a"),
+			generateTimes(t, model.TimeFromUnix(1), model.TimeFromUnix(10)),
+		),
+		lo.T2(phlaremodel.LabelsFromStrings("job", "b"),
+			generateTimes(t, model.TimeFromUnix(11), model.TimeFromUnix(20)),
+		),
+		lo.T2(phlaremodel.LabelsFromStrings("job", "c"),
+			generateTimes(t, model.TimeFromUnix(1), model.TimeFromUnix(10)),
+		),
+		lo.T2(phlaremodel.LabelsFromStrings("job", "d"),
+			generateTimes(t, model.TimeFromUnix(11), model.TimeFromUnix(20)),
+		),
+	}, series)
+
+	// Then we query 2 different shards and verify we have a subset of series.
+	it, err = queriers[0].SelectMatchingProfiles(ctx, matchAll)
+	require.NoError(t, err)
+	seriesResult, err := queriers[0].MergeByLabels(context.Background(), it, "job")
+	require.NoError(t, err)
+	require.Equal(t,
+		[]*typesv1.Series{
+			{
+				Labels: phlaremodel.LabelsFromStrings("job", "a"),
+				Points: generatePoints(t, model.TimeFromUnix(1), model.TimeFromUnix(10)),
+			},
+		}, seriesResult)
+
+	it, err = queriers[1].SelectMatchingProfiles(ctx, matchAll)
+	require.NoError(t, err)
+	seriesResult, err = queriers[1].MergeByLabels(context.Background(), it, "job")
+	require.NoError(t, err)
+	require.Equal(t,
+		[]*typesv1.Series{
+			{
+				Labels: phlaremodel.LabelsFromStrings("job", "b"),
+				Points: generatePoints(t, model.TimeFromUnix(11), model.TimeFromUnix(20)),
+			},
+		}, seriesResult)
+
+	// Finally test some stacktraces resolution.
+	it, err = queriers[1].SelectMatchingProfiles(ctx, matchAll)
+	require.NoError(t, err)
+	res, err := queriers[1].MergeByStacktraces(ctx, it)
+	require.NoError(t, err)
+
+	expected := new(phlaremodel.Tree)
+	expected.InsertStack(10, "baz", "bar", "foo")
+	require.Equal(t, expected.String(), res.String())
+}
+
+// nolint:unparam
+func profileSeriesGenerator(t *testing.T, from, through time.Time, interval time.Duration, lbls ...string) []*testhelper.ProfileBuilder {
+	t.Helper()
+	var builders []*testhelper.ProfileBuilder
+	for ts := from; ts.Before(through) || ts.Equal(through); ts = ts.Add(interval) {
+		builders = append(builders,
+			testhelper.NewProfileBuilder(ts.UnixNano()).
+				CPUProfile().
+				WithLabels(
+					lbls...,
+				).ForStacktraceString("foo", "bar", "baz").AddSamples(1))
+	}
+	return builders
+}
+
+func generatePoints(t *testing.T, from, through model.Time) []*typesv1.Point {
+	t.Helper()
+	var points []*typesv1.Point
+	for ts := from; ts.Before(through) || ts.Equal(through); ts = ts.Add(time.Second) {
+		points = append(points, &typesv1.Point{Timestamp: int64(ts), Value: 1})
+	}
+	return points
+}
+
+func generateTimes(t *testing.T, from, through model.Time) []model.Time {
+	t.Helper()
+	var times []model.Time
+	for ts := from; ts.Before(through) || ts.Equal(through); ts = ts.Add(time.Second) {
+		times = append(times, ts)
+	}
+	return times
 }
 
 func TestProfileRowIterator(t *testing.T) {
@@ -268,28 +416,22 @@ func TestSeriesRewriter(t *testing.T) {
 	})
 	rows, err := newProfileRowIterator(blk)
 	require.NoError(t, err)
-	filePath := filepath.Join(t.TempDir(), block.IndexFilename)
-	idxw, err := prepareIndexWriter(context.Background(), filePath, []BlockReader{blk})
-	require.NoError(t, err)
-	it := newSeriesRewriter(rows, idxw)
-	// tests that all rows are written to the correct series index
-	require.True(t, it.Next())
-	require.Equal(t, uint32(0), it.At().row.SeriesIndex())
-	require.True(t, it.Next())
-	require.Equal(t, uint32(0), it.At().row.SeriesIndex())
-	require.True(t, it.Next())
-	require.Equal(t, uint32(0), it.At().row.SeriesIndex())
-	require.True(t, it.Next())
-	require.Equal(t, uint32(1), it.At().row.SeriesIndex())
-	require.True(t, it.Next())
-	require.Equal(t, uint32(2), it.At().row.SeriesIndex())
-	require.True(t, it.Next())
-	require.Equal(t, uint32(2), it.At().row.SeriesIndex())
-	require.False(t, it.Next())
+	path := t.TempDir()
+	filePath := filepath.Join(path, block.IndexFilename)
+	idxw := newIndexRewriter(path)
+	seriesIdx := []uint32{}
+	for rows.Next() {
+		r := rows.At()
+		require.NoError(t, idxw.ReWriteRow(r))
+		seriesIdx = append(seriesIdx, r.row.SeriesIndex())
+	}
+	require.NoError(t, rows.Err())
+	require.NoError(t, rows.Close())
 
-	require.NoError(t, it.Err())
-	require.NoError(t, it.Close())
-	require.NoError(t, idxw.Close())
+	require.Equal(t, []uint32{0, 0, 0, 1, 2, 2}, seriesIdx)
+
+	err = idxw.Close(context.Background())
+	require.NoError(t, err)
 
 	idxr, err := index.NewFileReader(filePath)
 	require.NoError(t, err)
@@ -336,6 +478,28 @@ func TestSeriesRewriter(t *testing.T) {
 	}}, chunks)
 }
 
+func TestCompactOldBlock(t *testing.T) {
+	meta, err := block.ReadMetaFromDir("./testdata/01HD3X85G9BGAG4S3TKPNMFG4Z")
+	require.NoError(t, err)
+	dst := t.TempDir()
+	ctx := context.Background()
+	t.Log(meta)
+	bkt, err := client.NewBucket(ctx, client.Config{
+		StorageBackendConfig: client.StorageBackendConfig{
+			Backend: client.Filesystem,
+			Filesystem: filesystem.Config{
+				Directory: "./testdata/",
+			},
+		},
+	}, "test")
+	require.NoError(t, err)
+	br := NewSingleBlockQuerierFromMeta(context.Background(), bkt, meta)
+	require.NoError(t, br.Open(ctx))
+	_, err = CompactWithSplitting(ctx,
+		[]BlockReader{br}, 2, 0, dst, SplitByFingerprint)
+	require.NoError(t, err)
+}
+
 func TestFlushMeta(t *testing.T) {
 	b := newBlock(t, func() []*testhelper.ProfileBuilder {
 		return []*testhelper.ProfileBuilder{
@@ -362,7 +526,7 @@ func TestFlushMeta(t *testing.T) {
 	require.Equal(t, false, b.Meta().Compaction.Deletable)
 	require.Equal(t, false, b.Meta().Compaction.Failed)
 	require.Equal(t, []string(nil), b.Meta().Compaction.Hints)
-	require.Equal(t, []tsdb.BlockDesc(nil), b.Meta().Compaction.Parents)
+	require.Equal(t, []block.BlockDesc(nil), b.Meta().Compaction.Parents)
 	require.Equal(t, block.MetaVersion3, b.Meta().Version)
 	require.Equal(t, model.Time(1000), b.Meta().MinTime)
 	require.Equal(t, model.Time(3000), b.Meta().MaxTime)
@@ -411,7 +575,7 @@ func newBlock(t *testing.T, generator func() []*testhelper.ProfileBuilder) Block
 		StoragePrefix: "local",
 	}, "test")
 	require.NoError(t, err)
-	metaMap, err := block.ListBlocks(filepath.Join(dir, pathLocal), time.Time{})
+	metaMap, err := block.ListBlocks(filepath.Join(dir, PathLocal), time.Time{})
 	require.NoError(t, err)
 	require.Len(t, metaMap, 1)
 	var meta *block.Meta
@@ -449,7 +613,7 @@ func TestCompactMetas(t *testing.T) {
 			ULID:    ulid.MustParse("00000000000000000000000001"),
 			MinTime: model.TimeFromUnix(0),
 			MaxTime: model.TimeFromUnix(100),
-			Compaction: tsdb.BlockMetaCompaction{
+			Compaction: block.BlockMetaCompaction{
 				Level:   1,
 				Sources: []ulid.ULID{ulid.MustParse("00000000000000000000000001")},
 			},
@@ -459,7 +623,7 @@ func TestCompactMetas(t *testing.T) {
 			ULID:    ulid.MustParse("00000000000000000000000002"),
 			MinTime: model.TimeFromUnix(50),
 			MaxTime: model.TimeFromUnix(100),
-			Compaction: tsdb.BlockMetaCompaction{
+			Compaction: block.BlockMetaCompaction{
 				Level:   0,
 				Sources: []ulid.ULID{ulid.MustParse("00000000000000000000000002")},
 			},
@@ -469,26 +633,23 @@ func TestCompactMetas(t *testing.T) {
 			ULID:    ulid.MustParse("00000000000000000000000003"),
 			MinTime: model.TimeFromUnix(50),
 			MaxTime: model.TimeFromUnix(200),
-			Compaction: tsdb.BlockMetaCompaction{
+			Compaction: block.BlockMetaCompaction{
 				Level:   3,
 				Sources: []ulid.ULID{ulid.MustParse("00000000000000000000000003")},
 			},
 		},
 	}...)
 	labels := map[string]string{"foo": "bar", "bar": "buzz"}
-	if hostname, err := os.Hostname(); err == nil {
-		labels[block.HostnameLabel] = hostname
-	}
 	require.Equal(t, model.TimeFromUnix(0), actual.MinTime)
 	require.Equal(t, model.TimeFromUnix(200), actual.MaxTime)
-	require.Equal(t, tsdb.BlockMetaCompaction{
+	require.Equal(t, block.BlockMetaCompaction{
 		Level: 4,
 		Sources: []ulid.ULID{
 			ulid.MustParse("00000000000000000000000001"),
 			ulid.MustParse("00000000000000000000000002"),
 			ulid.MustParse("00000000000000000000000003"),
 		},
-		Parents: []tsdb.BlockDesc{
+		Parents: []block.BlockDesc{
 			{
 				ULID:    ulid.MustParse("00000000000000000000000001"),
 				MinTime: 0,
@@ -611,5 +772,21 @@ func generateParquetFile(t *testing.T, path string) {
 			{Name: fmt.Sprintf("name-%d", i)},
 		})
 		require.NoError(t, err)
+	}
+}
+
+func Test_SplitStages(t *testing.T) {
+	tests := []struct {
+		n, s   int
+		result [][]int
+	}{
+		{12, 3, [][]int{{0, 1, 2}, {3, 4, 5}, {6, 7, 8}, {9, 10, 11}}},
+		{7, 3, [][]int{{0, 1, 2}, {3, 4, 5}, {6}}},
+		{10, 2, [][]int{{0, 1}, {2, 3}, {4, 5}, {6, 7}, {8, 9}}},
+		{5, 5, [][]int{{0, 1, 2, 3, 4}}},
+	}
+
+	for _, test := range tests {
+		assert.Equal(t, test.result, splitStages(test.n, test.s))
 	}
 }

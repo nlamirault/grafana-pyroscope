@@ -28,14 +28,16 @@ import (
 	"github.com/grafana/dskit/services"
 	"github.com/grafana/dskit/signals"
 	wwtracing "github.com/grafana/dskit/tracing"
+	"github.com/grafana/pyroscope-go"
 	grpcgw "github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
+	"github.com/opentracing/opentracing-go"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/version"
-	"github.com/pyroscope-io/client/pyroscope"
 	"github.com/samber/lo"
 
 	"github.com/grafana/pyroscope/pkg/api"
 	"github.com/grafana/pyroscope/pkg/cfg"
+	"github.com/grafana/pyroscope/pkg/compactor"
 	"github.com/grafana/pyroscope/pkg/distributor"
 	"github.com/grafana/pyroscope/pkg/frontend"
 	"github.com/grafana/pyroscope/pkg/ingester"
@@ -53,6 +55,7 @@ import (
 	"github.com/grafana/pyroscope/pkg/usagestats"
 	"github.com/grafana/pyroscope/pkg/util"
 	"github.com/grafana/pyroscope/pkg/util/cli"
+	"github.com/grafana/pyroscope/pkg/util/spanprofiler"
 	"github.com/grafana/pyroscope/pkg/validation"
 	"github.com/grafana/pyroscope/pkg/validation/exporter"
 )
@@ -74,6 +77,7 @@ type Config struct {
 	Tracing           tracing.Config         `yaml:"tracing"`
 	OverridesExporter exporter.Config        `yaml:"overrides_exporter" doc:"hidden"`
 	RuntimeConfig     runtimeconfig.Config   `yaml:"runtime_config"`
+	Compactor         compactor.Config       `yaml:"compactor"`
 
 	Storage       StorageConfig       `yaml:"storage"`
 	SelfProfiling SelfProfilingConfig `yaml:"self_profiling,omitempty"`
@@ -138,6 +142,7 @@ func (c *Config) RegisterFlagsWithContext(ctx context.Context, f *flag.FlagSet) 
 	c.RuntimeConfig.RegisterFlags(f)
 	c.Analytics.RegisterFlags(f)
 	c.LimitsConfig.RegisterFlags(f)
+	c.Compactor.RegisterFlags(f, log.NewLogfmtLogger(os.Stderr))
 	c.API.RegisterFlags(f)
 }
 
@@ -149,7 +154,7 @@ func (c *Config) registerServerFlagsWithChangedDefaultValues(fs *flag.FlagSet) {
 	// but we can take values from throwaway flag set and reregister into supplied flags with new default values.
 	c.Server.RegisterFlags(throwaway)
 	c.Ingester.RegisterFlags(throwaway)
-	c.Distributor.RegisterFlags(throwaway)
+	c.Distributor.RegisterFlags(throwaway, log.NewLogfmtLogger(os.Stderr))
 	c.Frontend.RegisterFlags(throwaway, log.NewLogfmtLogger(os.Stderr))
 	c.QueryScheduler.RegisterFlags(throwaway, log.NewLogfmtLogger(os.Stderr))
 	c.Worker.RegisterFlags(throwaway)
@@ -159,12 +164,6 @@ func (c *Config) registerServerFlagsWithChangedDefaultValues(fs *flag.FlagSet) {
 		// Ignore errors when setting new values. We have a test to verify that it works.
 		switch f.Name {
 		case "server.http-listen-port":
-			_ = f.Value.Set("4040")
-		case "query-frontend.instance-port":
-			_ = f.Value.Set("4040")
-		case "distributor.ring.instance-port":
-			_ = f.Value.Set("4040")
-		case "overrides-exporter.ring.instance-port":
 			_ = f.Value.Set("4040")
 		case "distributor.replication-factor":
 			_ = f.Value.Set("1")
@@ -179,17 +178,21 @@ func (c *Config) Validate() error {
 	if len(c.Target) == 0 {
 		return errors.New("no modules specified")
 	}
+	if err := c.Compactor.Validate(c.PhlareDB.MaxBlockDuration); err != nil {
+		return err
+	}
 	return c.Ingester.Validate()
 }
 
 func (c *Config) ApplyDynamicConfig() cfg.Source {
 	c.Ingester.LifecyclerConfig.RingConfig.KVStore.Store = "memberlist"
 	c.Distributor.DistributorRing.KVStore.Store = c.Ingester.LifecyclerConfig.RingConfig.KVStore.Store
-	c.OverridesExporter.Ring.KVStore.Store = c.Ingester.LifecyclerConfig.RingConfig.KVStore.Store
+	c.OverridesExporter.Ring.Ring.KVStore.Store = c.Ingester.LifecyclerConfig.RingConfig.KVStore.Store
 	c.Frontend.QuerySchedulerDiscovery.SchedulerRing.KVStore.Store = c.Ingester.LifecyclerConfig.RingConfig.KVStore.Store
 	c.Worker.QuerySchedulerDiscovery.SchedulerRing.KVStore.Store = c.Ingester.LifecyclerConfig.RingConfig.KVStore.Store
 	c.QueryScheduler.ServiceDiscovery.SchedulerRing.KVStore.Store = c.Ingester.LifecyclerConfig.RingConfig.KVStore.Store
-	c.StoreGateway.ShardingRing.KVStore.Store = c.Ingester.LifecyclerConfig.RingConfig.KVStore.Store
+	c.StoreGateway.ShardingRing.Ring.KVStore.Store = c.Ingester.LifecyclerConfig.RingConfig.KVStore.Store
+	c.Compactor.ShardingRing.Common.KVStore.Store = c.Ingester.LifecyclerConfig.RingConfig.KVStore.Store
 
 	return func(dst cfg.Cloneable) error {
 		return nil
@@ -220,6 +223,7 @@ type Phlare struct {
 	usageReport   *usagestats.Reporter
 	RuntimeConfig *runtimeconfig.Manager
 	Overrides     *validation.Overrides
+	Compactor     *compactor.MultitenantCompactor
 
 	TenantLimits validation.TenantLimits
 
@@ -256,6 +260,9 @@ func New(cfg Config) (*Phlare, error) {
 		if err != nil {
 			level.Error(logger).Log("msg", "error in initializing tracing. tracing will not be enabled", "err", err)
 		}
+		if cfg.Tracing.ProfilingEnabled {
+			opentracing.SetGlobalTracer(spanprofiler.NewTracer(opentracing.GlobalTracer()))
+		}
 		phlare.tracer = trace
 	}
 
@@ -285,21 +292,22 @@ func (f *Phlare) setupModuleManager() error {
 	mm.RegisterModule(UsageReport, f.initUsageReport)
 	mm.RegisterModule(QueryFrontend, f.initQueryFrontend)
 	mm.RegisterModule(QueryScheduler, f.initQueryScheduler)
+	mm.RegisterModule(Compactor, f.initCompactor)
 	mm.RegisterModule(All, nil)
 
 	// Add dependencies
 	deps := map[string][]string{
 		All: {Ingester, Distributor, QueryScheduler, QueryFrontend, Querier, StoreGateway},
 
-		Server:         {GRPCGateway},
-		API:            {Server},
-		Distributor:    {Overrides, Ring, API, UsageReport},
-		Querier:        {Overrides, API, MemberlistKV, Ring, UsageReport},
-		QueryFrontend:  {OverridesExporter, API, MemberlistKV, UsageReport},
-		QueryScheduler: {Overrides, API, MemberlistKV, UsageReport},
-		Ingester:       {Overrides, API, MemberlistKV, Storage, UsageReport},
-		StoreGateway:   {API, Storage, Overrides, MemberlistKV, UsageReport},
-
+		Server:            {GRPCGateway},
+		API:               {Server},
+		Distributor:       {Overrides, Ring, API, UsageReport},
+		Querier:           {Overrides, API, MemberlistKV, Ring, UsageReport},
+		QueryFrontend:     {OverridesExporter, API, MemberlistKV, UsageReport},
+		QueryScheduler:    {Overrides, API, MemberlistKV, UsageReport},
+		Ingester:          {Overrides, API, MemberlistKV, Storage, UsageReport},
+		StoreGateway:      {API, Storage, Overrides, MemberlistKV, UsageReport},
+		Compactor:         {API, Storage, Overrides, MemberlistKV, UsageReport},
 		UsageReport:       {Storage, MemberlistKV},
 		Overrides:         {RuntimeConfig},
 		OverridesExporter: {Overrides, MemberlistKV},
@@ -350,7 +358,7 @@ func (f *Phlare) Run() error {
 	if err != nil {
 		return err
 	}
-	f.Server.HTTP.Path("/ready").Methods("GET").Handler(f.readyHandler(sm))
+	f.API.RegisterRoute("/ready", f.readyHandler(sm), false, false, "GET")
 
 	RegisterHealthServer(f.Server.HTTP, grpcutil.WithManager(sm))
 	healthy := func() {
@@ -498,7 +506,7 @@ func initLogger(logFormat string, logLevel dslog.Level) log.Logger {
 }
 
 func (f *Phlare) initAPI() (services.Service, error) {
-	a, err := api.New(f.Cfg.API, f.Server, f.grpcGatewayMux, util.Logger)
+	a, err := api.New(f.Cfg.API, f.Server, f.grpcGatewayMux, f.Server.Log)
 	if err != nil {
 		return nil, err
 	}

@@ -5,6 +5,7 @@ import (
 	"io"
 	"math"
 	"sort"
+	"strings"
 	"unsafe"
 
 	"github.com/google/uuid"
@@ -27,6 +28,7 @@ var (
 		phlareparquet.NewGroupField("StacktraceID", parquet.Encoded(parquet.Uint(64), &parquet.DeltaBinaryPacked)),
 		phlareparquet.NewGroupField("Value", parquet.Encoded(parquet.Int(64), &parquet.DeltaBinaryPacked)),
 		phlareparquet.NewGroupField("Labels", pprofLabels),
+		phlareparquet.NewGroupField("SpanID", parquet.Optional(parquet.Encoded(parquet.Uint(64), &parquet.RLEDictionary))),
 	}
 	ProfilesSchema = parquet.NewSchema("Profile", phlareparquet.Group{
 		phlareparquet.NewGroupField("ID", parquet.UUID()),
@@ -77,10 +79,49 @@ func init() {
 	stacktracePartitionColIndex = stacktracePartitionCol.ColumnIndex
 }
 
+var (
+	sampleStacktraceIDColumnPath = strings.Split("Samples.list.element.StacktraceID", ".")
+	sampleValueColumnPath        = strings.Split("Samples.list.element.Value", ".")
+	sampleSpanIDColumnPath       = strings.Split("Samples.list.element.SpanID", ".")
+)
+
+var ErrColumnNotFound = fmt.Errorf("column path not found")
+
+type SampleColumns struct {
+	StacktraceID parquet.LeafColumn
+	Value        parquet.LeafColumn
+	SpanID       parquet.LeafColumn
+}
+
+func (c *SampleColumns) Resolve(schema *parquet.Schema) error {
+	var err error
+	if c.StacktraceID, err = ResolveColumnByPath(schema, sampleStacktraceIDColumnPath); err != nil {
+		return err
+	}
+	if c.Value, err = ResolveColumnByPath(schema, sampleValueColumnPath); err != nil {
+		return err
+	}
+	// Optional.
+	c.SpanID, _ = ResolveColumnByPath(schema, sampleSpanIDColumnPath)
+	return nil
+}
+
+func (c *SampleColumns) HasSpanID() bool {
+	return c.SpanID.Node != nil
+}
+
+func ResolveColumnByPath(schema *parquet.Schema, path []string) (parquet.LeafColumn, error) {
+	if c, ok := schema.Lookup(path...); ok {
+		return c, nil
+	}
+	return parquet.LeafColumn{}, fmt.Errorf("%w: %v", ErrColumnNotFound, path)
+}
+
 type Sample struct {
 	StacktraceID uint64             `parquet:",delta"`
 	Value        int64              `parquet:",delta"`
 	Labels       []*profilev1.Label `parquet:",list"`
+	SpanID       uint64             `parquet:",optional"`
 }
 
 type Profile struct {
@@ -246,6 +287,9 @@ type InMemoryProfile struct {
 type Samples struct {
 	StacktraceIDs []uint32
 	Values        []uint64
+	// Span associated with samples.
+	// Optional: Spans == nil, if not present.
+	Spans []uint64
 }
 
 func NewSamples(size int) Samples {
@@ -278,8 +322,7 @@ func (s Samples) Compact(dedupe bool) Samples {
 	if dedupe {
 		s = trimDuplicateSamples(s)
 	}
-	s = trimZeroAndNegativeSamples(s)
-	return s
+	return trimZeroAndNegativeSamples(s)
 }
 
 func (s Samples) Clone() Samples {
@@ -310,19 +353,27 @@ func trimZeroAndNegativeSamples(samples Samples) Samples {
 		if v > 0 {
 			samples.Values[n] = v
 			samples.StacktraceIDs[n] = samples.StacktraceIDs[j]
+			if len(samples.Spans) > 0 {
+				samples.Spans[n] = samples.Spans[j]
+			}
 			n++
 		}
 	}
-	return Samples{
+	s := Samples{
 		StacktraceIDs: samples.StacktraceIDs[:n],
 		Values:        samples.Values[:n],
 	}
+	if len(samples.Spans) > 0 {
+		s.Spans = samples.Spans[:n]
+	}
+	return s
 }
 
 func cloneSamples(samples Samples) Samples {
 	return Samples{
 		StacktraceIDs: copySlice(samples.StacktraceIDs),
 		Values:        copySlice(samples.Values),
+		Spans:         copySlice(samples.Spans),
 	}
 }
 
@@ -333,10 +384,31 @@ func (s Samples) Less(i, j int) bool {
 func (s Samples) Swap(i, j int) {
 	s.StacktraceIDs[i], s.StacktraceIDs[j] = s.StacktraceIDs[j], s.StacktraceIDs[i]
 	s.Values[i], s.Values[j] = s.Values[j], s.Values[i]
+	if len(s.Spans) > 0 {
+		s.Spans[i], s.Spans[j] = s.Spans[j], s.Spans[i]
+	}
 }
 
 func (s Samples) Len() int {
 	return len(s.StacktraceIDs)
+}
+
+type SamplesBySpanID Samples
+
+func (s SamplesBySpanID) Less(i, j int) bool {
+	return s.Spans[i] < s.Spans[j]
+}
+
+func (s SamplesBySpanID) Swap(i, j int) {
+	s.StacktraceIDs[i], s.StacktraceIDs[j] = s.StacktraceIDs[j], s.StacktraceIDs[i]
+	s.Values[i], s.Values[j] = s.Values[j], s.Values[i]
+	if len(s.Spans) > 0 {
+		s.Spans[i], s.Spans[j] = s.Spans[j], s.Spans[i]
+	}
+}
+
+func (s SamplesBySpanID) Len() int {
+	return len(s.Spans)
 }
 
 func (s Samples) Sum() uint64 {
@@ -403,6 +475,9 @@ func (p InMemoryProfile) Total() int64 {
 }
 
 func copySlice[T any](in []T) []T {
+	if len(in) == 0 {
+		return nil
+	}
 	out := make([]T, len(in))
 	copy(out, in)
 	return out
@@ -422,7 +497,7 @@ func deconstructMemoryProfile(imp InMemoryProfile, row parquet.Row) parquet.Row 
 			col++
 			return col
 		}
-		totalCols = 8 + (6 * len(imp.Samples.StacktraceIDs)) + len(imp.Comments)
+		totalCols = 8 + (7 * len(imp.Samples.StacktraceIDs)) + len(imp.Comments)
 	)
 	if cap(row) < totalCols {
 		row = make(parquet.Row, 0, totalCols)
@@ -432,17 +507,19 @@ func deconstructMemoryProfile(imp InMemoryProfile, row parquet.Row) parquet.Row 
 	row = append(row, parquet.Int32Value(int32(imp.SeriesIndex)).Level(0, 0, newCol()))
 	row = append(row, parquet.Int64Value(int64(imp.StacktracePartition)).Level(0, 0, newCol()))
 	row = append(row, parquet.Int64Value(int64(imp.TotalValue)).Level(0, 0, newCol()))
+
 	newCol()
+	repetition := -1
 	if len(imp.Samples.Values) == 0 {
 		row = append(row, parquet.Value{}.Level(0, 0, col))
 	}
-	repetition := -1
 	for i := range imp.Samples.StacktraceIDs {
 		if repetition < 1 {
 			repetition++
 		}
 		row = append(row, parquet.Int64Value(int64(imp.Samples.StacktraceIDs[i])).Level(repetition, 1, col))
 	}
+
 	newCol()
 	repetition = -1
 	if len(imp.Samples.Values) == 0 {
@@ -454,6 +531,7 @@ func deconstructMemoryProfile(imp InMemoryProfile, row parquet.Row) parquet.Row 
 		}
 		row = append(row, parquet.Int64Value(int64(imp.Samples.Values[i])).Level(repetition, 1, col))
 	}
+
 	for i := 0; i < 4; i++ {
 		newCol()
 		repetition := -1
@@ -467,6 +545,29 @@ func deconstructMemoryProfile(imp InMemoryProfile, row parquet.Row) parquet.Row 
 			row = append(row, parquet.Value{}.Level(repetition, 1, col))
 		}
 	}
+
+	newCol()
+	repetition = -1
+	if len(imp.Samples.Spans) == 0 {
+		// Fill the row with empty entries (one per value).
+		if len(imp.Samples.Values) == 0 {
+			row = append(row, parquet.Value{}.Level(0, 0, col))
+		}
+		for range imp.Samples.Values {
+			if repetition < 1 {
+				repetition++
+			}
+			row = append(row, parquet.Value{}.Level(repetition, 1, col))
+		}
+	} else {
+		for i := range imp.Samples.Spans {
+			if repetition < 1 {
+				repetition++
+			}
+			row = append(row, parquet.Int64Value(int64(imp.Samples.Spans[i])).Level(repetition, 2, col))
+		}
+	}
+
 	if imp.DropFrames == 0 {
 		row = append(row, parquet.Value{}.Level(0, 0, newCol()))
 	} else {

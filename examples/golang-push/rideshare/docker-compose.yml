@@ -1,16 +1,13 @@
-version: '3'
+version: "3"
 services:
-  pyroscope:
-    image: grafana/pyroscope
-    ports:
-      - '4040:4040'
-
   us-east:
     ports:
       - 5000
     environment:
       - REGION=us-east
       - PYROSCOPE_SERVER_ADDRESS=http://pyroscope:4040
+      - PARAMETERS_POOL_SIZE=1000
+      - PARAMETERS_POOL_BUFFER_SIZE_KB=1000
     build:
       context: .
 
@@ -33,7 +30,14 @@ services:
     build:
       context: .
 
+  pyroscope:
+    image: grafana/pyroscope:latest
+    ports:
+      - '4040:4040'
+
   load-generator:
     build:
       context: .
       dockerfile: Dockerfile.load-generator
+    environment:
+      - PYROSCOPE_SERVER_ADDRESS=http://pyroscope:4040

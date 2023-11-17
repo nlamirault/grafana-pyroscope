@@ -62,11 +62,12 @@ type profileStore struct {
 	flushBufferLbs []phlaremodel.Labels
 }
 
-func newProfileWriter(writer io.Writer) *parquet.GenericWriter[*schemav1.Profile] {
-	return parquet.NewGenericWriter[*schemav1.Profile](writer, schemav1.ProfilesSchema,
-		parquet.ColumnPageBuffers(parquet.NewFileBufferPool(os.TempDir(), "pyroscopedb-parquet-buffers*")),
-		parquet.CreatedBy("github.com/grafana/pyroscope/", build.Version, build.Revision),
-		parquet.PageBufferSize(3*1024*1024),
+func newParquetProfileWriter(writer io.Writer, options ...parquet.WriterOption) *parquet.GenericWriter[*schemav1.Profile] {
+	options = append(options, parquet.PageBufferSize(3*1024*1024))
+	options = append(options, parquet.CreatedBy("github.com/grafana/pyroscope/", build.Version, build.Revision))
+	options = append(options, schemav1.ProfilesSchema)
+	return parquet.NewGenericWriter[*schemav1.Profile](
+		writer, options...,
 	)
 }
 
@@ -82,7 +83,7 @@ func newProfileStore(phlarectx context.Context) *profileStore {
 	go s.cutRowGroupLoop()
 	// Initialize writer on /dev/null
 	// TODO: Reuse parquet.Writer beyond life time of the head.
-	s.writer = newProfileWriter(io.Discard)
+	s.writer = newParquetProfileWriter(io.Discard)
 
 	return s
 }
@@ -238,7 +239,11 @@ func (s *profileStore) cutRowGroup(count int) (err error) {
 		s.path,
 		fmt.Sprintf("%s.%d%s", s.persister.Name(), s.rowsFlushed, block.ParquetSuffix),
 	)
-
+	// Removes the file if it exists. This can happen if the previous
+	// cut attempt failed.
+	if err := os.Remove(path); err == nil {
+		level.Warn(s.logger).Log("msg", "deleting row group segment of a failed previous attempt", "path", path)
+	}
 	f, err := s.prepareFile(path)
 	if err != nil {
 		return err

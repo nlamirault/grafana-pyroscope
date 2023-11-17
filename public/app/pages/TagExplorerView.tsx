@@ -7,19 +7,15 @@ import TotalSamplesChart from '@pyroscope/pages/tagExplorer/components/TotalSamp
 import type { Profile } from '@pyroscope/legacy/models';
 import Box, { CollapseBox } from '@pyroscope/ui/Box';
 import Toolbar from '@pyroscope/components/Toolbar';
-import ExportData from '@pyroscope/components/ExportData';
 import TimelineChartWrapper, {
   TimelineGroupData,
 } from '@pyroscope/components/TimelineChart/TimelineChartWrapper';
-import { FlamegraphRenderer } from '@pyroscope/legacy/flamegraph';
 import Dropdown, { MenuItem } from '@pyroscope/ui/Dropdown';
 import TagsSelector from '@pyroscope/pages/tagExplorer/components/TagsSelector';
 import TableUI, { useTableSort, BodyRow } from '@pyroscope/ui/Table';
-import useColorMode from '@pyroscope/hooks/colorMode.hook';
 import useTimeZone from '@pyroscope/hooks/timeZone.hook';
 import { appendLabelToQuery } from '@pyroscope/util/query';
 import { useAppDispatch, useAppSelector } from '@pyroscope/redux/hooks';
-import useExportToFlamegraphDotCom from '@pyroscope/components/exportToFlamegraphDotCom.hook';
 import {
   actions,
   setDateRange,
@@ -34,7 +30,7 @@ import {
   setQuery,
   selectAnnotationsOrDefault,
 } from '@pyroscope/redux/reducers/continuous';
-import { queryToAppName } from '@pyroscope/models/query';
+import { brandQuery, parse, queryToAppName } from '@pyroscope/models/query';
 import PageTitle from '@pyroscope/components/PageTitle';
 import ExploreTooltip from '@pyroscope/components/TimelineChart/ExploreTooltip';
 import { getFormatter } from '@pyroscope/legacy/flamegraph/format/format';
@@ -50,6 +46,7 @@ import {
 // eslint-disable-next-line
 import styles from './TagExplorerView.module.scss';
 import { formatTitle } from './formatTitle';
+import { FlameGraphWrapper } from '@pyroscope/components/FlameGraphWrapper';
 
 const TIMELINE_SERIES_COLORS = [
   Color.rgb(242, 204, 12),
@@ -164,7 +161,6 @@ const getTimelineColor = (index: number, palette: Color[]): Color =>
 
 function TagExplorerView() {
   const { offset } = useTimeZone();
-  const { colorMode } = useColorMode();
   const dispatch = useAppDispatch();
 
   const { from, until, tagExplorerView, refreshToken } = useAppSelector(
@@ -180,7 +176,7 @@ function TagExplorerView() {
 
   useEffect(() => {
     if (query) {
-      dispatch(fetchTags(query));
+      dispatch(fetchTags({ query, includeLeftAndRight: false }));
     }
   }, [query, dispatch]);
 
@@ -197,10 +193,10 @@ function TagExplorerView() {
       return () => fetchData.abort('cancel');
     }
     return undefined;
-  }, [from, until, query, groupByTagValue, dispatch]);
+  }, [from, until, query, groupByTagValue, refreshToken, dispatch]);
 
   useEffect(() => {
-    if (from && until && query) {
+    if (from && until && query && groupByTag) {
       const fetchData = dispatch(fetchTagExplorerView(null));
       return () => fetchData.abort('cancel');
     }
@@ -266,11 +262,6 @@ function TagExplorerView() {
     dispatch(actions.setTagExplorerViewGroupByTag(value));
   };
 
-  const exportFlamegraphDotComFn = useExportToFlamegraphDotCom(
-    activeTagProfile,
-    groupByTag,
-    groupByTagValue
-  );
   // when there's no groupByTag value backend returns groups with single "*" group,
   // which is "application without any tag" group. when backend returns multiple groups,
   // "*" group samples array is filled with zeros (not longer valid application data).
@@ -301,10 +292,10 @@ function TagExplorerView() {
     sortedGroupsByTotal.length
   );
 
-  const groups =
+  // These aggregates are for displaying stats on groups not in the top N
+  const aggregates =
     filteredGroupsData.length > TOP_N_ROWS
       ? [
-          ...topNGroups,
           {
             tagName: OTHER_TAG_NAME,
             color: Color('#888'),
@@ -315,7 +306,12 @@ function TagExplorerView() {
             },
           } as TimelineGroupData,
         ]
-      : filteredGroupsData;
+      : [];
+
+  // The timeline will only consider the top N groups.
+  const groupsForTimeline = topNGroups;
+  // The pie chart and table will also include aggregate groups (i.e., "Other")
+  const groupsAndAggregates = [...topNGroups, ...aggregates];
 
   const formatter =
     activeTagProfile &&
@@ -339,7 +335,7 @@ function TagExplorerView() {
             dispatch(setQuery(query));
           }}
         />
-        <Box>
+        <Box isLoading={dataLoading}>
           <ExploreHeader
             appName={appName}
             tags={tags}
@@ -350,38 +346,35 @@ function TagExplorerView() {
             handleGroupByTagValueChange={handleGroupByTagValueChange}
           />
           <div id={TIMELINE_WRAPPER_ID} className={styles.timelineWrapper}>
-            <LoadingOverlay active={dataLoading}>
-              <TimelineChartWrapper
-                selectionType="double"
-                mode="multiple"
-                timezone={offset === 0 ? 'utc' : 'browser'}
-                data-testid="timeline-explore-page"
-                id="timeline-chart-explore-page"
-                annotations={annotations}
-                timelineGroups={groups}
-                // to not "dim" timelines when "All" option is selected
-                activeGroup={
-                  groupByTagValue !== ALL_TAGS ? groupByTagValue : ''
-                }
-                showTagsLegend={groups.length > 1}
-                handleGroupByTagValueChange={handleGroupByTagValueChange}
-                onSelect={(from, until) =>
-                  dispatch(setDateRange({ from, until }))
-                }
-                height="125px"
-                format="lines"
-                onHoverDisplayTooltip={(data) => (
-                  <ExploreTooltip
-                    values={data.values}
-                    timeLabel={data.timeLabel}
-                    profile={activeTagProfile}
-                  />
-                )}
-              />
-            </LoadingOverlay>
+            <TimelineChartWrapper
+              selectionType="double"
+              mode="multiple"
+              timezone={offset === 0 ? 'utc' : 'browser'}
+              data-testid="timeline-explore-page"
+              id="timeline-chart-explore-page"
+              annotations={annotations}
+              timelineGroups={groupsForTimeline}
+              // to not "dim" timelines when "All" option is selected
+              activeGroup={groupByTagValue !== ALL_TAGS ? groupByTagValue : ''}
+              showTagsLegend={groupsForTimeline.length > 1}
+              handleGroupByTagValueChange={handleGroupByTagValueChange}
+              onSelect={(from, until) =>
+                dispatch(setDateRange({ from, until }))
+              }
+              height="125px"
+              format="lines"
+              onHoverDisplayTooltip={(data) => (
+                <ExploreTooltip
+                  values={data.values}
+                  timeLabel={data.timeLabel}
+                  profile={activeTagProfile}
+                />
+              )}
+            />
           </div>
         </Box>
         <CollapseBox
+          isLoading={dataLoading}
           title={appName
             .map((a) => `${a} Tag Breakdown`)
             .unwrapOr('Tag Breakdown')}
@@ -390,7 +383,7 @@ function TagExplorerView() {
             <div className={styles.pieChartWrapper}>
               <TotalSamplesChart
                 formatter={formatter}
-                filteredGroupsData={groups}
+                filteredGroupsData={groupsAndAggregates}
                 profile={activeTagProfile}
                 isLoading={dataLoading}
               />
@@ -400,7 +393,7 @@ function TagExplorerView() {
               whereDropdownItems={whereDropdownItems}
               groupByTag={groupByTag}
               groupByTagValue={groupByTagValue}
-              groupsData={groups}
+              groupsData={groupsAndAggregates}
               handleGroupByTagValueChange={handleGroupByTagValueChange}
               isLoading={dataLoading}
               activeTagProfile={activeTagProfile}
@@ -408,28 +401,9 @@ function TagExplorerView() {
             />
           </div>
         </CollapseBox>
-        <Box>
+        <Box isLoading={dataLoading}>
           <div className={styles.flamegraphWrapper}>
-            <LoadingOverlay active={dataLoading}>
-              <FlamegraphRenderer
-                showCredit={false}
-                profile={activeTagProfile}
-                colorMode={colorMode}
-                ExportData={
-                  activeTagProfile && (
-                    <ExportData
-                      flamebearer={activeTagProfile}
-                      exportPNG
-                      exportJSON
-                      exportPprof
-                      exportHTML
-                      exportFlamegraphDotCom
-                      exportFlamegraphDotComFn={exportFlamegraphDotComFn}
-                    />
-                  )
-                }
-              />
-            </LoadingOverlay>
+            <FlameGraphWrapper profile={activeTagProfile} />
           </div>
         </Box>
       </div>
@@ -480,11 +454,18 @@ function Table({
     }
 
     const searchParams = new URLSearchParams(search);
-    searchParams.delete('query');
-    searchParams.set(
-      'query',
-      appendLabelToQuery(`${appName}{}`, groupByTag, groupByTagValue)
+    const originalQuery = searchParams.get('query');
+    const serviceName = originalQuery
+      ? parse(brandQuery(originalQuery))?.tags?.service_name
+      : '';
+    const newQuery = appendLabelToQuery(
+      `${appName}{service_name="${serviceName}"}`,
+      groupByTag,
+      groupByTagValue
     );
+
+    searchParams.delete('query');
+    searchParams.set('query', newQuery);
     return `?${searchParams.toString()}`;
   };
 
@@ -692,7 +673,8 @@ function ExploreHeader({
 
   useEffect(() => {
     if (tagKeys.length && !selectedTag) {
-      handleGroupByTagChange(tagKeys[0]);
+      const firstGoodTag = tagKeys.find((tag) => !tag.startsWith('__'));
+      handleGroupByTagChange(firstGoodTag || tagKeys[0]);
     }
   }, [tagKeys, selectedTag, handleGroupByTagChange]);
 

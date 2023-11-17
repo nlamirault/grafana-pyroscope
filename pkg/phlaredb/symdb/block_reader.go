@@ -18,8 +18,10 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/grafana/pyroscope/pkg/objstore"
+	parquetobj "github.com/grafana/pyroscope/pkg/objstore/parquet"
 	"github.com/grafana/pyroscope/pkg/phlaredb/block"
 	schemav1 "github.com/grafana/pyroscope/pkg/phlaredb/schemas/v1"
+	"github.com/grafana/pyroscope/pkg/util/refctr"
 )
 
 type Reader struct {
@@ -27,22 +29,19 @@ type Reader struct {
 	files  map[string]block.File
 	meta   *block.Meta
 
-	maxConcurrentChunks  int
 	chunkFetchBufferSize int
 
-	index      IndexFile
-	partitions map[uint64]*partition
+	index         IndexFile
+	partitions    []*partition
+	partitionsMap map[uint64]*partition
 
-	locations parquetFile
-	mappings  parquetFile
-	functions parquetFile
-	strings   parquetFile
+	locations parquetobj.File
+	mappings  parquetobj.File
+	functions parquetobj.File
+	strings   parquetobj.File
 }
 
-const (
-	defaultMaxConcurrentChunks  = 1
-	defaultChunkFetchBufferSize = 4096
-)
+const defaultChunkFetchBufferSize = 4096
 
 func Open(ctx context.Context, b objstore.BucketReader, m *block.Meta) (*Reader, error) {
 	r := Reader{
@@ -50,7 +49,6 @@ func Open(ctx context.Context, b objstore.BucketReader, m *block.Meta) (*Reader,
 		meta:   m,
 		files:  make(map[string]block.File),
 
-		maxConcurrentChunks:  defaultMaxConcurrentChunks,
 		chunkFetchBufferSize: defaultChunkFetchBufferSize,
 	}
 	if err := r.open(ctx); err != nil {
@@ -71,9 +69,12 @@ func (r *Reader) open(ctx context.Context) (err error) {
 			return err
 		}
 	}
-	r.partitions = make(map[uint64]*partition, len(r.index.PartitionHeaders))
-	for _, h := range r.index.PartitionHeaders {
-		r.partitions[h.Partition] = r.partitionReader(h)
+	r.partitionsMap = make(map[uint64]*partition, len(r.index.PartitionHeaders))
+	r.partitions = make([]*partition, len(r.index.PartitionHeaders))
+	for i, h := range r.index.PartitionHeaders {
+		ph := r.partitionReader(h)
+		r.partitionsMap[h.Partition] = ph
+		r.partitions[i] = ph
 	}
 	return nil
 }
@@ -95,8 +96,16 @@ func (r *Reader) openIndexFile(ctx context.Context) error {
 	return err
 }
 
+const parquetReadBufferSize = 256 << 10 // 256KB
+
 func (r *Reader) openParquetFiles(ctx context.Context) error {
-	m := map[string]*parquetFile{
+	options := []parquet.FileOption{
+		parquet.SkipBloomFilters(true), // we don't use bloom filters
+		parquet.FileReadMode(parquet.ReadModeAsync),
+		parquet.ReadBufferSize(parquetReadBufferSize),
+	}
+
+	m := map[string]*parquetobj.File{
 		new(schemav1.LocationPersister).Name() + block.ParquetSuffix: &r.locations,
 		new(schemav1.MappingPersister).Name() + block.ParquetSuffix:  &r.mappings,
 		new(schemav1.FunctionPersister).Name() + block.ParquetSuffix: &r.functions,
@@ -111,7 +120,7 @@ func (r *Reader) openParquetFiles(ctx context.Context) error {
 			if err != nil {
 				return err
 			}
-			if err = fp.open(ctx, r.bucket, fm); err != nil {
+			if err = fp.Open(ctx, r.bucket, fm, options...); err != nil {
 				return fmt.Errorf("openning file %q: %w", n, err)
 			}
 			return nil
@@ -161,10 +170,10 @@ func (r *Reader) Close() error {
 		return nil
 	}
 	return multierror.New(
-		r.locations.close(),
-		r.mappings.close(),
-		r.functions.close(),
-		r.strings.close()).
+		r.locations.Close(),
+		r.mappings.Close(),
+		r.functions.Close(),
+		r.strings.Close()).
 		Err()
 }
 
@@ -175,7 +184,7 @@ func (r *Reader) Partition(ctx context.Context, partition uint64) (PartitionRead
 }
 
 func (r *Reader) partition(ctx context.Context, partition uint64) (*partition, error) {
-	p, ok := r.partitions[partition]
+	p, ok := r.partitionsMap[partition]
 	if !ok {
 		return nil, ErrPartitionNotFound
 	}
@@ -195,20 +204,22 @@ type partition struct {
 	strings          parquetTableRange[string, *schemav1.StringPersister]
 }
 
-func (p *partition) init(ctx context.Context) error {
-	g, ctx := errgroup.WithContext(ctx)
+func (p *partition) init(ctx context.Context) (err error) { return p.tx().fetch(ctx) }
+
+func (p *partition) Release() { p.tx().release() }
+
+func (p *partition) tx() *fetchTx {
+	tx := make(fetchTx, 0, len(p.stacktraceChunks)+4)
 	for _, c := range p.stacktraceChunks {
-		c := c
-		g.Go(func() error { return c.fetch(ctx) })
+		tx.append(c)
 	}
 	if p.reader.index.Header.Version > FormatV1 {
-		g.Go(func() error { return p.locations.fetch(ctx) })
-		g.Go(func() error { return p.mappings.fetch(ctx) })
-		g.Go(func() error { return p.functions.fetch(ctx) })
-		g.Go(func() error { return p.strings.fetch(ctx) })
+		tx.append(&p.locations)
+		tx.append(&p.mappings)
+		tx.append(&p.functions)
+		tx.append(&p.strings)
 	}
-	err := g.Wait()
-	return err
+	return &tx
 }
 
 func (p *partition) Symbols() *Symbols {
@@ -219,26 +230,6 @@ func (p *partition) Symbols() *Symbols {
 		Functions:   p.functions.s,
 		Strings:     p.strings.s,
 	}
-}
-
-func (p *partition) Release() {
-	var wg sync.WaitGroup
-	wg.Add(len(p.stacktraceChunks))
-	for _, c := range p.stacktraceChunks {
-		c := c
-		go func() {
-			c.release()
-			wg.Done()
-		}()
-	}
-	if p.reader.index.Header.Version > FormatV1 {
-		wg.Add(4)
-		go func() { p.locations.release(); wg.Done() }()
-		go func() { p.mappings.release(); wg.Done() }()
-		go func() { p.functions.release(); wg.Done() }()
-		go func() { p.strings.release(); wg.Done() }()
-	}
-	wg.Wait()
 }
 
 func (p *partition) WriteStats(s *PartitionStats) {
@@ -256,25 +247,22 @@ func (p *partition) WriteStats(s *PartitionStats) {
 
 var ErrInvalidStacktraceRange = fmt.Errorf("invalid range: stack traces can't be resolved")
 
-func (p *partition) ResolveStacktraceLocations(ctx context.Context, dst StacktraceInserter, s []uint32) error {
+func (p *partition) ResolveStacktraceLocations(ctx context.Context, dst StacktraceInserter, s []uint32) (err error) {
 	if len(s) == 0 {
 		return nil
 	}
 	if len(p.stacktraceChunks) == 0 {
 		return ErrInvalidStacktraceRange
 	}
-
 	// First, we determine the chunks needed for the range.
 	// All chunks in a block must have the same StacktraceMaxNodes.
 	sr := SplitStacktraces(s, p.stacktraceChunks[0].header.StacktraceMaxNodes)
-
-	g, ctx := errgroup.WithContext(ctx)
-	g.SetLimit(p.reader.maxConcurrentChunks)
 	for _, c := range sr {
-		g.Go(p.lookupStacktraces(ctx, dst, c).do)
+		if err = p.lookupStacktraces(ctx, dst, c).do(); err != nil {
+			return err
+		}
 	}
-
-	return g.Wait()
+	return nil
 }
 
 func (p *partition) setStacktracesChunks(chunks []StacktraceChunkHeader) {
@@ -331,12 +319,11 @@ type stacktraceChunkReader struct {
 	reader *Reader
 	header StacktraceChunkHeader
 
-	m sync.Mutex
-	r int64
+	r refctr.Counter
 	t *parentPointerTree
 }
 
-func (c *stacktraceChunkReader) fetch(ctx context.Context) (err error) {
+func (c *stacktraceChunkReader) fetch(ctx context.Context) error {
 	span, ctx := opentracing.StartSpanFromContext(ctx, "stacktraceChunkReader.fetch")
 	span.LogFields(
 		otlog.Int64("size", c.header.Size),
@@ -344,33 +331,21 @@ func (c *stacktraceChunkReader) fetch(ctx context.Context) (err error) {
 		otlog.Uint32("stacks", c.header.Stacktraces),
 	)
 	defer span.Finish()
-	// Mutex is acquired to serialize access to the tree,
-	// so that the consequent callers only have access to
-	// it after it is fully loaded. Use of atomics here
-	// for reference counting is not sufficient.
-	c.m.Lock()
-	defer func() {
+	return c.r.Inc(func() error {
+		f, err := c.reader.file(StacktracesFileName)
 		if err != nil {
-			c.r--
+			return err
 		}
-		c.m.Unlock()
-	}()
-	if c.r++; c.r > 1 {
-		return nil
-	}
-	f, err := c.reader.file(StacktracesFileName)
-	if err != nil {
-		return err
-	}
-	rc, err := c.reader.bucket.GetRange(ctx, f.RelPath, c.header.Offset, c.header.Size)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		err = multierror.New(err, rc.Close()).Err()
-	}()
-	// Consider pooling the buffer.
-	return c.readFrom(bufio.NewReaderSize(rc, c.reader.chunkFetchBufferSize))
+		rc, err := c.reader.bucket.GetRange(ctx, f.RelPath, c.header.Offset, c.header.Size)
+		if err != nil {
+			return err
+		}
+		defer func() {
+			err = multierror.New(err, rc.Close()).Err()
+		}()
+		// Consider pooling the buffer.
+		return c.readFrom(bufio.NewReaderSize(rc, c.reader.chunkFetchBufferSize))
+	})
 }
 
 func (c *stacktraceChunkReader) readFrom(r io.Reader) error {
@@ -387,7 +362,7 @@ func (c *stacktraceChunkReader) readFrom(r io.Reader) error {
 	crc := crc32.New(castagnoli)
 	tee := io.TeeReader(r, crc)
 	if _, err := t.ReadFrom(tee); err != nil {
-		return fmt.Errorf("failed to unmarshal stack treaces: %w", err)
+		return fmt.Errorf("failed to unmarshal stack traces: %w", err)
 	}
 	if c.header.CRC != crc.Sum32() {
 		return ErrInvalidCRC
@@ -397,62 +372,9 @@ func (c *stacktraceChunkReader) readFrom(r io.Reader) error {
 }
 
 func (c *stacktraceChunkReader) release() {
-	// To avoid race with "fetch" caller that could
-	// have started re-reading the tree right after
-	// the reference counter has decreased to 0.
-	c.m.Lock()
-	if c.r--; c.r < 1 {
+	c.r.Dec(func() {
 		c.t = nil
-	}
-	c.m.Unlock()
-}
-
-type parquetFile struct {
-	*parquet.File
-	reader objstore.ReaderAtCloser
-	path   string
-	size   int64
-}
-
-const parquetReadBufferSize = 256 << 10 // 256KB
-
-func (f *parquetFile) open(ctx context.Context, b objstore.BucketReader, meta block.File) error {
-	f.path = meta.RelPath
-	f.size = int64(meta.SizeBytes)
-	if f.size == 0 {
-		attrs, err := b.Attributes(ctx, f.path)
-		if err != nil {
-			return fmt.Errorf("getting attributes: %w", err)
-		}
-		f.size = attrs.Size
-	}
-	var err error
-	// the same reader is used to serve all requests, so we pass context.Background() here
-	if f.reader, err = b.ReaderAt(context.Background(), f.path); err != nil {
-		return fmt.Errorf("creating reader: %w", err)
-	}
-
-	// first try to open file, this is required otherwise OpenFile panics
-	f.File, err = parquet.OpenFile(f.reader, f.size,
-		parquet.SkipPageIndex(true),
-		parquet.SkipBloomFilters(true))
-	if err != nil {
-		return err
-	}
-
-	// now open it for real
-	f.File, err = parquet.OpenFile(f.reader, f.size,
-		parquet.SkipBloomFilters(true), // we don't use bloom filters
-		parquet.FileReadMode(parquet.ReadModeAsync),
-		parquet.ReadBufferSize(parquetReadBufferSize))
-	return err
-}
-
-func (f *parquetFile) close() (err error) {
-	if f.reader != nil {
-		return f.reader.Close()
-	}
-	return nil
+	})
 }
 
 type parquetTableRange[M schemav1.Models, P schemav1.Persister[M]] struct {
@@ -460,10 +382,9 @@ type parquetTableRange[M schemav1.Models, P schemav1.Persister[M]] struct {
 	bucket    objstore.BucketReader
 	persister P
 
-	file *parquetFile
+	file *parquetobj.File
 
-	m sync.RWMutex
-	r int64
+	r refctr.Counter
 	s []M
 }
 
@@ -477,43 +398,35 @@ func (t *parquetTableRange[M, P]) fetch(ctx context.Context) (err error) {
 		"row_groups": len(t.headers),
 	})
 	defer span.Finish()
-	t.m.Lock()
-	defer func() {
-		if err != nil {
-			t.r--
+	return t.r.Inc(func() error {
+		var s uint32
+		for _, h := range t.headers {
+			s += h.Rows
 		}
-		t.m.Unlock()
-	}()
-	if t.r++; t.r > 1 {
+		buf := make([]parquet.Row, inMemoryReaderRowsBufSize)
+		t.s = make([]M, s)
+		var offset int
+		// TODO(kolesnikovae): Row groups could be fetched in parallel.
+		rgs := t.file.RowGroups()
+		for _, h := range t.headers {
+			span.LogFields(
+				otlog.Uint32("row_group", h.RowGroup),
+				otlog.Uint32("index_row", h.Index),
+				otlog.Uint32("rows", h.Rows),
+			)
+			rg := rgs[h.RowGroup]
+			rows := rg.Rows()
+			if err := rows.SeekToRow(int64(h.Index)); err != nil {
+				return err
+			}
+			dst := t.s[offset : offset+int(h.Rows)]
+			if err := t.readRows(dst, buf, rows); err != nil {
+				return fmt.Errorf("reading row group from parquet file %q: %w", t.file.Path(), err)
+			}
+			offset += int(h.Rows)
+		}
 		return nil
-	}
-	var s uint32
-	for _, h := range t.headers {
-		s += h.Rows
-	}
-	buf := make([]parquet.Row, inMemoryReaderRowsBufSize)
-	t.s = make([]M, s)
-	var offset int
-	// TODO(kolesnikovae): Row groups could be fetched in parallel.
-	rgs := t.file.RowGroups()
-	for _, h := range t.headers {
-		span.LogFields(
-			otlog.Uint32("row_group", h.RowGroup),
-			otlog.Uint32("index_row", h.Index),
-			otlog.Uint32("rows", h.Rows),
-		)
-		rg := rgs[h.RowGroup]
-		rows := rg.Rows()
-		if err := rows.SeekToRow(int64(h.Index)); err != nil {
-			return err
-		}
-		dst := t.s[offset : offset+int(h.Rows)]
-		if err := t.readRows(dst, buf, rows); err != nil {
-			return fmt.Errorf("reading row group from parquet file %q: %w", t.file.path, err)
-		}
-		offset += int(h.Rows)
-	}
-	return nil
+	})
 }
 
 func (t *parquetTableRange[M, P]) readRows(dst []M, buf []parquet.Row, rows parquet.Rows) (err error) {
@@ -546,9 +459,54 @@ func (t *parquetTableRange[M, P]) readRows(dst []M, buf []parquet.Row, rows parq
 }
 
 func (t *parquetTableRange[M, P]) release() {
-	t.m.Lock()
-	if t.r--; t.r < 1 {
+	t.r.Dec(func() {
 		t.s = nil
+	})
+}
+
+// fetchTx facilitates fetching multiple objects in a transactional manner:
+// if one of the objects has failed, all the remaining ones are released.
+type fetchTx []fetch
+
+type fetch interface {
+	fetch(context.Context) error
+	release()
+}
+
+func (tx *fetchTx) append(x fetch) { *tx = append(*tx, x) }
+
+func (tx *fetchTx) fetch(ctx context.Context) (err error) {
+	defer func() {
+		if err != nil {
+			tx.release()
+		}
+	}()
+	g, ctx := errgroup.WithContext(ctx)
+	for i, x := range *tx {
+		i := i
+		x := x
+		g.Go(func() error {
+			fErr := x.fetch(ctx)
+			if fErr != nil {
+				(*tx)[i] = nil
+			}
+			return fErr
+		})
 	}
-	t.m.Unlock()
+	return g.Wait()
+}
+
+func (tx *fetchTx) release() {
+	var wg sync.WaitGroup
+	wg.Add(len(*tx))
+	for _, x := range *tx {
+		x := x
+		go func() {
+			defer wg.Done()
+			if x != nil {
+				x.release()
+			}
+		}()
+	}
+	wg.Wait()
 }

@@ -31,6 +31,9 @@ EMBEDASSETS ?= embedassets
 VPREFIX := github.com/grafana/pyroscope/pkg/util/build
 GO_LDFLAGS   := -X $(VPREFIX).Branch=$(GIT_BRANCH) -X $(VPREFIX).Version=$(IMAGE_TAG) -X $(VPREFIX).Revision=$(GIT_REVISION) -X $(VPREFIX).BuildDate=$(GIT_LAST_COMMIT_DATE)
 
+# Add extra arguments to helm commands
+HELM_ARGS =
+
 .PHONY: help
 help: ## Describe useful make targets
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "%-30s %s\n", $$1, $$2}'
@@ -50,7 +53,7 @@ generate: $(BIN)/buf $(BIN)/protoc-gen-go $(BIN)/protoc-gen-go-vtproto $(BIN)/pr
 	find pkg/ \( -name \*.pb.go -o -name \*.connect\*.go \) -delete
 	cd api/ && PATH=$(BIN) $(BIN)/buf generate
 	cd pkg && PATH=$(BIN) $(BIN)/buf generate
-	PATH=$(BIN):$(PATH) ./tools/add-parquet-tags.sh
+	PATH="$(BIN):$(PATH)" ./tools/add-parquet-tags.sh
 	go run ./tools/doc-generator/ ./docs/sources/configure-server/reference-configuration-parameters/index.template > docs/sources/configure-server/reference-configuration-parameters/index.md
 
 .PHONY: buf/lint
@@ -58,9 +61,11 @@ buf/lint: $(BIN)/buf
 	cd api/ && $(BIN)/buf lint || true # TODO: Fix linting problems and remove the always true
 	cd pkg && $(BIN)/buf lint || true # TODO: Fix linting problems and remove the always true
 
+EBPF_TESTS='^TestEBPF.*'
+
 .PHONY: go/test
 go/test: $(BIN)/gotestsum
-	$(BIN)/gotestsum -- $(GO_TEST_FLAGS) ./... ./ebpf/...
+	$(BIN)/gotestsum -- $(GO_TEST_FLAGS) -skip $(EBPF_TESTS) ./... ./ebpf/...
 
 .PHONY: build
 build: frontend/build go/bin ## Do a production build (requiring the frontend build to be present)
@@ -134,6 +139,10 @@ go/mod:
 	cd api/ && GO111MODULE=on go mod tidy
 	cd ebpf/ && GO111MODULE=on go mod download
 	cd ebpf/ && GO111MODULE=on go mod tidy
+	cd examples/golang-push/rideshare/ && GO111MODULE=on go mod download
+	cd examples/golang-push/rideshare/ && GO111MODULE=on go mod tidy
+	cd examples/golang-push/simple/ && GO111MODULE=on go mod download
+	cd examples/golang-push/simple/ && GO111MODULE=on go mod tidy
 
 .PHONY: fmt
 fmt: $(BIN)/golangci-lint $(BIN)/buf $(BIN)/tk ## Automatically fix some lint errors
@@ -161,7 +170,7 @@ define deploy
 	# Load image into nodes
 	$(BIN)/kind load docker-image --name $(KIND_CLUSTER) $(IMAGE_PREFIX)pyroscope:$(IMAGE_TAG)
 	kubectl get pods
-	$(BIN)/helm upgrade --install $(1) ./operations/pyroscope/helm/pyroscope $(2) \
+	$(BIN)/helm upgrade --install $(1) ./operations/pyroscope/helm/pyroscope $(2) $(HELM_ARGS) \
 		--set pyroscope.image.tag=$(IMAGE_TAG) \
 		--set pyroscope.image.repository=$(IMAGE_PREFIX)pyroscope \
 		--set pyroscope.podAnnotations.image-id=$(shell cat .docker-image-id-pyroscope) \
@@ -308,7 +317,7 @@ $(BIN)/updater: Makefile
 
 $(BIN)/goreleaser: Makefile go.mod
 	@mkdir -p $(@D)
-	GOBIN=$(abspath $(@D)) $(GO) install github.com/goreleaser/goreleaser@v1.14.1
+	GOBIN=$(abspath $(@D)) $(GO) install github.com/goreleaser/goreleaser@v1.20.0
 
 $(BIN)/gotestsum: Makefile go.mod
 	@mkdir -p $(@D)
@@ -332,6 +341,10 @@ $(BIN)/trunk: Makefile
 	@mkdir -p $(@D)
 	curl -L https://trunk.io/releases/trunk -o $(@D)/trunk
 	chmod +x $(@D)/trunk
+
+.PHONY: cve/check
+cve/check:
+	docker run -t -i --rm --volume "$(CURDIR)/:/repo" -u "$(shell id -u)" aquasec/trivy:0.45.1 filesystem --cache-dir /repo/.cache/trivy --scanners vuln --skip-dirs .tmp/ --skip-dirs node_modules/ --skip-dirs tools/monitoring/vendor/ /repo
 
 KIND_CLUSTER = pyroscope-dev
 
@@ -361,10 +374,10 @@ helm/check: $(BIN)/kubeconform $(BIN)/helm
 	$(BIN)/helm dependency update ./operations/pyroscope/helm/pyroscope/
 	$(BIN)/helm dependency build ./operations/pyroscope/helm/pyroscope/
 	mkdir -p ./operations/pyroscope/helm/pyroscope/rendered/
-	$(BIN)/helm template --kube-version "1.22.0" pyroscope-dev ./operations/pyroscope/helm/pyroscope/ \
+	$(BIN)/helm template -n default --kube-version "1.22.0" pyroscope-dev ./operations/pyroscope/helm/pyroscope/ \
 		| tee ./operations/pyroscope/helm/pyroscope/rendered/single-binary.yaml \
 		| $(BIN)/kubeconform --summary --strict --kubernetes-version 1.22.0
-	$(BIN)/helm template --kube-version "1.22.0" pyroscope-dev ./operations/pyroscope/helm/pyroscope/ --values operations/pyroscope/helm/pyroscope/values-micro-services.yaml \
+	$(BIN)/helm template -n default --kube-version "1.22.0" pyroscope-dev ./operations/pyroscope/helm/pyroscope/ --values operations/pyroscope/helm/pyroscope/values-micro-services.yaml \
 		| tee ./operations/pyroscope/helm/pyroscope/rendered/micro-services.yaml \
 		| $(BIN)/kubeconform --summary --strict --kubernetes-version 1.22.0
 	cat operations/pyroscope/helm/pyroscope/values-micro-services.yaml \
@@ -382,7 +395,7 @@ deploy: $(BIN)/kind $(BIN)/helm docker-image/pyroscope/build
 
 .PHONY: deploy-micro-services
 deploy-micro-services: $(BIN)/kind $(BIN)/helm docker-image/pyroscope/build
-	$(call deploy,pyroscope-micro-services,--values=operations/pyroscope/helm/pyroscope/values-micro-services.yaml --set pyroscope.components.querier.resources=null --set pyroscope.components.distributor.resources=null --set pyroscope.components.ingester.resources=null --set pyroscope.components.store-gateway.resources=null)
+	$(call deploy,pyroscope-micro-services,--values=operations/pyroscope/helm/pyroscope/values-micro-services.yaml --set pyroscope.components.querier.resources=null --set pyroscope.components.distributor.resources=null --set pyroscope.components.ingester.resources=null --set pyroscope.components.store-gateway.resources=null --set pyroscope.components.compactor.resources=null)
 
 .PHONY: deploy-monitoring
 deploy-monitoring: $(BIN)/tk $(BIN)/kind tools/monitoring/environments/default/spec.json
@@ -396,6 +409,19 @@ tools/monitoring/environments/default/spec.json: $(BIN)/tk $(BIN)/kind
 	echo "import 'monitoring.libsonnet'" > tools/monitoring/environments/default/main.jsonnet
 	$(BIN)/tk env set tools/monitoring/environments/default --server=$(shell $(BIN)/kind get kubeconfig --name pyroscope-dev | grep server: | sed 's/server://g' | xargs) --namespace=monitoring
 
+.PHONY: tools/update_examples
+tools/update_examples:
+	go run tools/update_examples.go
+
+.phony: rideshare/docker/push
+rideshare/docker/push:
+	docker buildx build --push --platform $(IMAGE_PLATFORM) -t $(IMAGE_PREFIX)pyroscope-rideshare-golang   -t $(IMAGE_PREFIX)pyroscope-rideshare-golang:$(IMAGE_TAG)   examples/golang-push/rideshare
+	docker buildx build --push --platform $(IMAGE_PLATFORM) -t $(IMAGE_PREFIX)pyroscope-rideshare-loadgen  -t $(IMAGE_PREFIX)pyroscope-rideshare-loadgen:$(IMAGE_TAG) -f examples/golang-push/rideshare/Dockerfile.load-generator examples/golang-push/rideshare
+	docker buildx build --push --platform $(IMAGE_PLATFORM) -t $(IMAGE_PREFIX)pyroscope-rideshare-python   -t $(IMAGE_PREFIX)pyroscope-rideshare-python:$(IMAGE_TAG)   examples/python/rideshare/flask
+	docker buildx build --push --platform $(IMAGE_PLATFORM) -t $(IMAGE_PREFIX)pyroscope-rideshare-ruby     -t $(IMAGE_PREFIX)pyroscope-rideshare-ruby:$(IMAGE_TAG)     examples/ruby/rideshare_rails
+	docker buildx build --push --platform $(IMAGE_PLATFORM) -t $(IMAGE_PREFIX)pyroscope-rideshare-dotnet   -t $(IMAGE_PREFIX)pyroscope-rideshare-dotnet:$(IMAGE_TAG)   examples/dotnet/rideshare/
+	docker buildx build --push --platform $(IMAGE_PLATFORM) -t $(IMAGE_PREFIX)pyroscope-rideshare-java     -t $(IMAGE_PREFIX)pyroscope-rideshare-java:$(IMAGE_TAG)     examples/java/rideshare
+	docker buildx build --push --platform $(IMAGE_PLATFORM) -t $(IMAGE_PREFIX)pyroscope-rideshare-rust     -t $(IMAGE_PREFIX)pyroscope-rideshare-rust:$(IMAGE_TAG)     examples/rust/rideshare
 
 .PHONY: docs/%
 docs/%:

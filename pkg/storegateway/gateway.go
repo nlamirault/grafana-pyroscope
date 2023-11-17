@@ -34,6 +34,7 @@ var errInvalidTenantShardSize = errors.New("invalid tenant shard size, the value
 
 type Limits interface {
 	ShardingLimits
+	phlareobj.TenantConfigProvider
 }
 
 // ShardingLimits is the interface that should be implemented by the limits provider,
@@ -84,7 +85,7 @@ func (c *Config) Validate(limits validation.Limits) error {
 
 func NewStoreGateway(gatewayCfg Config, storageBucket phlareobj.Bucket, limits Limits, logger log.Logger, reg prometheus.Registerer) (*StoreGateway, error) {
 	ringStore, err := kv.NewClient(
-		gatewayCfg.ShardingRing.KVStore,
+		gatewayCfg.ShardingRing.Ring.KVStore,
 		ring.GetCodec(),
 		kv.RegistererWithKVName(prometheus.WrapRegistererWithPrefix("pyroscope_", reg), "store-gateway"),
 		logger,
@@ -126,15 +127,15 @@ func newStoreGateway(gatewayCfg Config, storageBucket phlareobj.Bucket, ringStor
 	delegate := ring.BasicLifecyclerDelegate(ring.NewInstanceRegisterDelegate(ring.JOINING, RingNumTokens))
 	delegate = ring.NewLeaveOnStoppingDelegate(delegate, logger)
 	delegate = ring.NewTokensPersistencyDelegate(gatewayCfg.ShardingRing.TokensFilePath, ring.JOINING, delegate, logger)
-	delegate = ring.NewAutoForgetDelegate(ringAutoForgetUnhealthyPeriods*gatewayCfg.ShardingRing.HeartbeatTimeout, delegate, logger)
+	delegate = ring.NewAutoForgetDelegate(ringAutoForgetUnhealthyPeriods*gatewayCfg.ShardingRing.Ring.HeartbeatTimeout, delegate, logger)
 
-	g.ringLifecycler, err = ring.NewBasicLifecycler(lifecyclerCfg, RingNameForServer, RingKey, ringStore, delegate, logger, prometheus.WrapRegistererWithPrefix("cortex_", reg))
+	g.ringLifecycler, err = ring.NewBasicLifecycler(lifecyclerCfg, RingNameForServer, RingKey, ringStore, delegate, logger, prometheus.WrapRegistererWithPrefix("pyroscope_", reg))
 	if err != nil {
 		return nil, errors.Wrap(err, "create ring lifecycler")
 	}
 
 	ringCfg := gatewayCfg.ShardingRing.ToRingConfig()
-	g.ring, err = ring.NewWithStoreClientAndStrategy(ringCfg, RingNameForServer, RingKey, ringStore, ring.NewIgnoreUnhealthyInstancesReplicationStrategy(), prometheus.WrapRegistererWithPrefix("cortex_", reg), logger)
+	g.ring, err = ring.NewWithStoreClientAndStrategy(ringCfg, RingNameForServer, RingKey, ringStore, ring.NewIgnoreUnhealthyInstancesReplicationStrategy(), prometheus.WrapRegistererWithPrefix("pyroscope_", reg), logger)
 	if err != nil {
 		return nil, errors.Wrap(err, "create ring client")
 	}

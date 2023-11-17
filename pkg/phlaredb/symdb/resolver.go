@@ -7,6 +7,7 @@ import (
 
 	"github.com/google/pprof/profile"
 	"github.com/opentracing/opentracing-go"
+	"github.com/opentracing/opentracing-go/log"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/grafana/pyroscope/pkg/model"
@@ -21,8 +22,9 @@ import (
 //
 // A new Resolver must be created for each profile.
 type Resolver struct {
-	ctx  context.Context
-	span opentracing.Span
+	ctx    context.Context
+	cancel context.CancelFunc
+	span   opentracing.Span
 
 	s SymbolsReader
 	g *errgroup.Group
@@ -42,8 +44,10 @@ func WithMaxConcurrent(n int) ResolverOption {
 }
 
 type lazyPartition struct {
+	id      uint64
+	reader  chan PartitionReader
 	samples map[uint32]int64
-	c       chan *Symbols
+	err     chan error
 	done    chan struct{}
 }
 
@@ -54,11 +58,15 @@ func NewResolver(ctx context.Context, s SymbolsReader) *Resolver {
 		p: make(map[uint64]*lazyPartition),
 	}
 	r.span, r.ctx = opentracing.StartSpanFromContext(ctx, "NewResolver")
-	r.g, r.ctx = errgroup.WithContext(ctx)
+	r.ctx, r.cancel = context.WithCancel(r.ctx)
+	r.g, r.ctx = errgroup.WithContext(r.ctx)
 	return &r
 }
 
 func (r *Resolver) Release() {
+	r.cancel()
+	// The error is already sent to the caller.
+	_ = r.g.Wait()
 	r.span.Finish()
 }
 
@@ -68,7 +76,18 @@ func (r *Resolver) Release() {
 func (r *Resolver) AddSamples(partition uint64, s schemav1.Samples) {
 	p := r.Partition(partition)
 	for i, sid := range s.StacktraceIDs {
-		p[sid] += int64(s.Values[i])
+		if sid > 0 {
+			p[sid] += int64(s.Values[i])
+		}
+	}
+}
+
+func (r *Resolver) AddSamplesWithSpanSelector(partition uint64, s schemav1.Samples, spanSelector model.SpanSelector) {
+	p := r.Partition(partition)
+	for i, sid := range s.StacktraceIDs {
+		if _, ok := spanSelector[s.Spans[i]]; ok {
+			p[sid] += int64(s.Values[i])
+		}
 	}
 }
 
@@ -83,101 +102,111 @@ func (r *Resolver) Partition(partition uint64) map[uint32]int64 {
 		return p.samples
 	}
 	p = &lazyPartition{
+		id:      partition,
 		samples: make(map[uint32]int64),
+		err:     make(chan error),
 		done:    make(chan struct{}),
-		c:       make(chan *Symbols, 1),
+		reader:  make(chan PartitionReader, 1),
 	}
 	r.p[partition] = p
 	r.m.Unlock()
 	r.g.Go(func() error {
-		pr, err := r.s.Partition(r.ctx, partition)
-		if err != nil {
-			return err
-		}
-		defer pr.Release()
+		return r.acquirePartition(p)
+	})
+	// r.g.Wait() is only called at Resolver.Release.
+	return p.samples
+}
+
+func (r *Resolver) acquirePartition(p *lazyPartition) error {
+	pr, err := r.s.Partition(r.ctx, p.id)
+	if err != nil {
+		r.span.LogFields(log.String("err", err.Error()))
 		select {
 		case <-r.ctx.Done():
 			return r.ctx.Err()
-		case p.c <- pr.Symbols():
-			<-p.done
+		case p.err <- err:
+			// Signal the partition receiver
+			// about the failure, so it won't
+			// block and return early.
+			return err
 		}
-		return nil
-	})
-	return p.samples
+	}
+	// We've acquired the partition and must release it
+	// once resolution finished or canceled.
+	select {
+	case p.reader <- pr:
+		// We transferred ownership to the recipient,
+		// which is now responsible for releasing the
+		// partition.
+		<-p.done
+	case <-r.ctx.Done():
+		// We still own the partition and must release
+		// it on our own. It's guaranteed that p.c receiver
+		// has no access to the partition.
+		pr.Release()
+		return r.ctx.Err()
+	}
+	return nil
 }
 
 func (r *Resolver) Tree() (*model.Tree, error) {
 	span, ctx := opentracing.StartSpanFromContext(r.ctx, "Resolver.Tree")
 	defer span.Finish()
-
-	g, ctx := errgroup.WithContext(ctx)
-	g.SetLimit(r.c)
-
-	var tm sync.Mutex
+	var lock sync.Mutex
 	tree := new(model.Tree)
-
-	for _, p := range r.p {
-		p := p
-		g.Go(func() error {
-			defer close(p.done)
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case symbols := <-p.c:
-				samples := schemav1.NewSamplesFromMap(p.samples)
-				rt, err := symbols.Tree(ctx, samples)
-				if err != nil {
-					return err
-				}
-				tm.Lock()
-				tree.Merge(rt)
-				tm.Unlock()
-			}
-			return nil
-		})
-	}
-	if err := g.Wait(); err != nil {
-		return nil, err
-	}
-
-	return tree, nil
+	err := r.withSymbols(ctx, func(symbols *Symbols, samples schemav1.Samples) error {
+		resolved, err := symbols.Tree(ctx, samples)
+		if err != nil {
+			return err
+		}
+		lock.Lock()
+		tree.Merge(resolved)
+		lock.Unlock()
+		return nil
+	})
+	return tree, err
 }
 
 func (r *Resolver) Profile() (*profile.Profile, error) {
 	span, ctx := opentracing.StartSpanFromContext(r.ctx, "Resolver.Profile")
 	defer span.Finish()
+	var lock sync.Mutex
+	profiles := make([]*profile.Profile, 0, len(r.p))
+	err := r.withSymbols(ctx, func(symbols *Symbols, samples schemav1.Samples) error {
+		resolved, err := symbols.Profile(ctx, samples)
+		if err != nil {
+			return err
+		}
+		lock.Lock()
+		profiles = append(profiles, resolved)
+		lock.Unlock()
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return profile.Merge(profiles)
+}
 
+func (r *Resolver) withSymbols(ctx context.Context, fn func(*Symbols, schemav1.Samples) error) error {
 	g, ctx := errgroup.WithContext(ctx)
 	g.SetLimit(r.c)
-
-	var rm sync.Mutex
-	profiles := make([]*profile.Profile, 0, len(r.p))
-
 	for _, p := range r.p {
 		p := p
 		g.Go(func() error {
 			defer close(p.done)
 			select {
+			case err := <-p.err:
+				return err
 			case <-ctx.Done():
 				return ctx.Err()
-			case symbols := <-p.c:
-				samples := schemav1.NewSamplesFromMap(p.samples)
-				rp, err := symbols.Profile(ctx, samples)
-				if err != nil {
-					return err
-				}
-				rm.Lock()
-				profiles = append(profiles, rp)
-				rm.Unlock()
+			case pr := <-p.reader:
+				defer pr.Release()
+				return fn(pr.Symbols(), schemav1.NewSamplesFromMap(p.samples))
 			}
-			return nil
 		})
 	}
-	if err := g.Wait(); err != nil {
-		return nil, err
-	}
-
-	return profile.Merge(profiles)
+	return g.Wait()
 }
 
 func (r *Symbols) Tree(ctx context.Context, samples schemav1.Samples) (*model.Tree, error) {
@@ -279,7 +308,8 @@ func (r *pprofSymbols) init(symbols *Symbols, samples schemav1.Samples) {
 	r.symbols = symbols
 	r.samples = &samples
 	r.profile = &profile.Profile{
-		Sample: make([]*profile.Sample, len(samples.StacktraceIDs)),
+		Sample:     make([]*profile.Sample, len(samples.StacktraceIDs)),
+		PeriodType: new(profile.ValueType),
 	}
 	r.locations = grow(r.locations, len(r.symbols.Locations))
 	r.mappings = grow(r.mappings, len(r.symbols.Mappings))

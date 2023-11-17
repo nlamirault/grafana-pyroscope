@@ -54,14 +54,15 @@ func (r *Rewriter) getOrCreatePartition(partition uint64) (_ *partitionRewriter,
 
 	n := &partitionRewriter{name: partition}
 	n.dst = r.symdb.PartitionWriter(partition)
+	// Note that the partition is not released: we want to keep
+	// it during the whole lifetime of the rewriter.
 	pr, err := r.source.Partition(context.TODO(), partition)
 	if err != nil {
 		return nil, err
 	}
-
-	// Note that the partition is not released: we want to keep
-	// it during the whole lifetime of the rewriter.
-	n.src = pr.Symbols()
+	// We clone locations, functions, and mappings,
+	// because these object will be modified.
+	n.src = cloneSymbolsPartially(pr.Symbols())
 	var stats PartitionStats
 	pr.WriteStats(&stats)
 
@@ -242,6 +243,26 @@ func (p *partitionRewriter) InsertStacktrace(stacktrace uint32, locations []int3
 	p.stacktraces.values[idx] = n
 }
 
+func cloneSymbolsPartially(x *Symbols) *Symbols {
+	n := Symbols{
+		Stacktraces: x.Stacktraces,
+		Locations:   make([]*schemav1.InMemoryLocation, len(x.Locations)),
+		Mappings:    make([]*schemav1.InMemoryMapping, len(x.Mappings)),
+		Functions:   make([]*schemav1.InMemoryFunction, len(x.Functions)),
+		Strings:     x.Strings,
+	}
+	for i, l := range x.Locations {
+		n.Locations[i] = l.Clone()
+	}
+	for i, m := range x.Mappings {
+		n.Mappings[i] = m.Clone()
+	}
+	for i, f := range x.Functions {
+		n.Functions[i] = f.Clone()
+	}
+	return &n
+}
+
 const (
 	marker     = 1 << 31
 	markerMask = math.MaxUint32 >> 1
@@ -284,6 +305,11 @@ func (t *lookupTable[T]) reset() {
 // for future resolve, and returned values is the marked
 // index to unresolved.
 func (t *lookupTable[T]) tryLookup(x uint32) uint32 {
+	// todo(ctovena): this is a hack to make sure we don't have any out of bounds errors
+	// see https://github.com/grafana/pyroscope/issues/2488
+	if x >= uint32(len(t.resolved)) {
+		t.grow(int(x + 1))
+	}
 	if v := t.resolved[x]; v != 0 {
 		if v&marker > 0 {
 			return v // Already marked for resolve.

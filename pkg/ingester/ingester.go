@@ -80,7 +80,6 @@ func (i *ingesterFlusherCompat) Flush() {
 }
 
 func New(phlarectx context.Context, cfg Config, dbConfig phlaredb.Config, storageBucket phlareobj.Bucket, limits Limits) (*Ingester, error) {
-
 	i := &Ingester{
 		cfg:           cfg,
 		phlarectx:     phlarectx,
@@ -97,7 +96,7 @@ func New(phlarectx context.Context, cfg Config, dbConfig phlaredb.Config, storag
 		localBucketCfg phlareobjclient.Config
 		err            error
 	)
-	localBucketCfg.Backend = "filesystem"
+	localBucketCfg.Backend = phlareobjclient.Filesystem
 	localBucketCfg.Filesystem.Directory = dbConfig.DataPath
 	i.localBucket, err = phlareobjclient.NewBucket(phlarectx, localBucketCfg, "local")
 	if err != nil {
@@ -115,8 +114,24 @@ func New(phlarectx context.Context, cfg Config, dbConfig phlaredb.Config, storag
 		return nil, err
 	}
 
-	rpEnforcer := newRetentionPolicyEnforcer(phlarecontext.Logger(phlarectx), i, defaultRetentionPolicy(), dbConfig)
-	i.subservices, err = services.NewManager(i.lifecycler, rpEnforcer)
+	retentionPolicy := defaultRetentionPolicy()
+
+	if dbConfig.EnforcementInterval > 0 {
+		retentionPolicy.EnforcementInterval = dbConfig.EnforcementInterval
+	}
+	if dbConfig.MinFreeDisk > 0 {
+		retentionPolicy.MinFreeDisk = dbConfig.MinFreeDisk
+	}
+	if dbConfig.MinDiskAvailablePercentage > 0 {
+		retentionPolicy.MinDiskAvailablePercentage = dbConfig.MinDiskAvailablePercentage
+	}
+
+	if dbConfig.DisableEnforcement {
+		i.subservices, err = services.NewManager(i.lifecycler)
+	} else {
+		rpEnforcer := newRetentionPolicyEnforcer(phlarecontext.Logger(phlarectx), i, retentionPolicy, dbConfig)
+		i.subservices, err = services.NewManager(i.lifecycler, rpEnforcer)
+	}
 	if err != nil {
 		return nil, errors.Wrap(err, "services manager")
 	}
@@ -234,7 +249,6 @@ func (i *Ingester) evictBlock(tenantID string, b ulid.ULID, fn func() error) (er
 
 func (i *Ingester) Push(ctx context.Context, req *connect.Request[pushv1.PushRequest]) (*connect.Response[pushv1.PushResponse], error) {
 	return forInstanceUnary(ctx, i, func(instance *instance) (*connect.Response[pushv1.PushResponse], error) {
-		level.Debug(instance.logger).Log("msg", "message received by ingester push")
 		for _, series := range req.Msg.Series {
 			for _, sample := range series.Samples {
 				err := pprof.FromBytes(sample.RawProfile, func(p *profilev1.Profile, size int) error {
@@ -248,8 +262,6 @@ func (i *Ingester) Push(ctx context.Context, req *connect.Request[pushv1.PushReq
 							validation.DiscardedProfiles.WithLabelValues(string(reason), instance.tenantID).Add(float64(1))
 							validation.DiscardedBytes.WithLabelValues(string(reason), instance.tenantID).Add(float64(size))
 							switch validation.ReasonOf(err) {
-							case validation.OutOfOrder:
-								return connect.NewError(connect.CodeInvalidArgument, err)
 							case validation.SeriesLimit:
 								return connect.NewError(connect.CodeResourceExhausted, err)
 							}
@@ -270,7 +282,7 @@ func (i *Ingester) Flush(ctx context.Context, req *connect.Request[ingesterv1.Fl
 	i.instancesMtx.RLock()
 	defer i.instancesMtx.RUnlock()
 	for _, inst := range i.instances {
-		if err := inst.Flush(ctx); err != nil {
+		if err := inst.Flush(ctx, true, "api"); err != nil {
 			return nil, err
 		}
 	}
